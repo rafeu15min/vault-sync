@@ -201,6 +201,64 @@ fn init_logging() {
     }
 }
 
+/// A maioria dos comandos não faz sentido nenhum sem `config.json` (não há
+/// pra onde sincronizar) — só um punhado de comandos utilitários
+/// (`get-proton`/`set-proton` fora do catálogo, etc.) toleram rodar sem.
+/// Mensagem de erro consistente entre os ~13 comandos que exigem config.
+fn require_config(cfg: Option<config::Config>, command: &str) -> anyhow::Result<config::Config> {
+    cfg.ok_or_else(|| {
+        anyhow::anyhow!(
+            "'{command}' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
+        )
+    })
+}
+
+/// Confirmação de uma operação irrevogável: zenity quando há sessão
+/// gráfica (`display::confirm`), senão cai pro prompt de terminal de
+/// sempre — nunca assume uma resposta quando não há como perguntar.
+/// `question` e `terminal_prompt` costumam variar (o segundo é mais curto,
+/// pensado pra caber numa linha só de `eprint!`).
+fn confirm_irrevocable(
+    gui_title: &str,
+    question: &str,
+    terminal_prompt: &str,
+) -> anyhow::Result<bool> {
+    match display::confirm(gui_title, question) {
+        Some(answer) => Ok(answer),
+        None => {
+            eprint!("{terminal_prompt}");
+            use std::io::Write as _;
+            std::io::stderr().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            Ok(answer.trim().eq_ignore_ascii_case("sim"))
+        }
+    }
+}
+
+/// `get-proton`/`set-proton` só fazem sentido pra atalhos non-Steam (o
+/// Proton oficial de jogos Steam é gerenciado pela própria Steam) — os
+/// dois resolvem `selection` pro catálogo e extraem o `app_id` da mesma
+/// forma, rejeitando qualquer outra origem antes de prosseguir.
+fn resolve_non_steam_shortcut(
+    cfg: &config::Config,
+    selection: &str,
+) -> anyhow::Result<(catalog::CatalogEntry, String)> {
+    let catalog = catalog::build_catalog_best_effort(cfg)?;
+    let entry = catalog
+        .find_by_rofi_line(selection, cfg.server_name(), cfg.client_name())
+        .ok_or_else(|| anyhow::anyhow!("'{selection}' não está mais no catálogo"))?
+        .clone();
+    let app_id = match &entry.source {
+        domain::GameSource::NonSteamShortcut { app_id, .. } => app_id.to_string(),
+        _ => anyhow::bail!(
+            "seleção de Proton só se aplica a atalhos non-Steam (esta é {:?})",
+            entry.source
+        ),
+    };
+    Ok((entry, app_id))
+}
+
 fn main() -> anyhow::Result<()> {
     init_logging();
     let cli = Cli::parse();
@@ -214,11 +272,7 @@ fn main() -> anyhow::Result<()> {
             steam,
             heroic,
         } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'run' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "run")?;
             let launcher = if heroic {
                 Launcher::Heroic
             } else {
@@ -235,11 +289,7 @@ fn main() -> anyhow::Result<()> {
             )?;
         }
         Command::Catalog { format } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'catalog' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "catalog")?;
             // Deliberadamente sem `ensure_reachable` aqui — este comando
             // alimenta o menu rofi (`vault-sync-menu.sh`) e precisa aparecer
             // na hora; esperar o FeuVault ligar (~2min) faria o SUPER+G
@@ -278,11 +328,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::MenuLaunch { selection } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'menu-launch' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "menu-launch")?;
             remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
             let catalog = catalog::build_catalog(&cfg)?;
             let entry = catalog
@@ -485,11 +531,7 @@ fn main() -> anyhow::Result<()> {
             steam,
             heroic,
         } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'purge' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "purge")?;
             let launcher = if heroic {
                 Launcher::Heroic
             } else {
@@ -499,24 +541,15 @@ fn main() -> anyhow::Result<()> {
 
             if !yes {
                 let server_name = cfg.server_name();
-                let question = format!(
-                    "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes.\n\nContinuar?"
-                );
-                let confirmed = match display::confirm("vault-sync — purge", &question) {
-                    Some(answer) => answer,
-                    None => {
-                        // Sem sessão gráfica — cai pro prompt de terminal
-                        // de sempre, nunca assume uma resposta.
-                        eprint!(
-                            "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes. Digite 'sim' para confirmar: "
-                        );
-                        use std::io::Write as _;
-                        std::io::stderr().flush().ok();
-                        let mut answer = String::new();
-                        std::io::stdin().read_line(&mut answer)?;
-                        answer.trim().eq_ignore_ascii_case("sim")
-                    }
-                };
+                let confirmed = confirm_irrevocable(
+                    "vault-sync — purge",
+                    &format!(
+                        "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes.\n\nContinuar?"
+                    ),
+                    &format!(
+                        "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes. Digite 'sim' para confirmar: "
+                    ),
+                )?;
                 if !confirmed {
                     anyhow::bail!("purge cancelado — confirmação não recebida");
                 }
@@ -551,11 +584,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Update { app_id } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'update' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "update")?;
 
             // Propositalmente sem `remote::ensure_reachable` -- update.rs
             // nunca toca o FeuVault, então uma falha de SSH aqui não deveria
@@ -584,11 +613,7 @@ fn main() -> anyhow::Result<()> {
             and_purge_local,
             only,
         } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'ingest' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "ingest")?;
 
             remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
 
@@ -841,11 +866,7 @@ fn main() -> anyhow::Result<()> {
             display::notify_result("vault-sync — scan concluído", &summary_text, false);
         }
         Command::Doctor => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'doctor' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "doctor")?;
 
             let report = doctor::run_doctor(&cfg);
 
@@ -958,11 +979,7 @@ fn main() -> anyhow::Result<()> {
             display::notify_result("vault-sync — doctor", &summary_text, false);
         }
         Command::List => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'list' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "list")?;
 
             remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
 
@@ -1060,11 +1077,7 @@ fn main() -> anyhow::Result<()> {
             );
         }
         Command::Stage { name } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'stage' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let cfg = require_config(cfg, "stage")?;
             let root = cfg.local_game_root_piratas.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("'local_game_root_piratas' não configurado — nada pra adotar")
             })?;
@@ -1140,22 +1153,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::GetProton { selection } => {
-            let cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'get-proton' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
-            let catalog = catalog::build_catalog_best_effort(&cfg)?;
-            let entry = catalog
-                .find_by_rofi_line(&selection, cfg.server_name(), cfg.client_name())
-                .ok_or_else(|| anyhow::anyhow!("'{selection}' não está mais no catálogo"))?;
-            let app_id = match &entry.source {
-                domain::GameSource::NonSteamShortcut { app_id, .. } => app_id.to_string(),
-                _ => anyhow::bail!(
-                    "seleção de Proton só se aplica a atalhos non-Steam (esta é {:?})",
-                    entry.source
-                ),
-            };
+            let cfg = require_config(cfg, "get-proton")?;
+            let (entry, app_id) = resolve_non_steam_shortcut(&cfg, &selection)?;
             let tool_name = cfg.proton_overrides.get(&app_id).ok_or_else(|| {
                 anyhow::anyhow!(
                     "'{}' ainda não tem Proton padrão definido",
@@ -1165,22 +1164,8 @@ fn main() -> anyhow::Result<()> {
             println!("{tool_name}");
         }
         Command::SetProton { selection, name } => {
-            let mut cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'set-proton' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
-            let catalog = catalog::build_catalog_best_effort(&cfg)?;
-            let entry = catalog
-                .find_by_rofi_line(&selection, cfg.server_name(), cfg.client_name())
-                .ok_or_else(|| anyhow::anyhow!("'{selection}' não está mais no catálogo"))?;
-            let app_id = match &entry.source {
-                domain::GameSource::NonSteamShortcut { app_id, .. } => app_id.to_string(),
-                _ => anyhow::bail!(
-                    "seleção de Proton só se aplica a atalhos non-Steam (esta é {:?})",
-                    entry.source
-                ),
-            };
+            let mut cfg = require_config(cfg, "set-proton")?;
+            let (entry, app_id) = resolve_non_steam_shortcut(&cfg, &selection)?;
 
             let steam_root = scan::find_steam_root();
             // Nunca grava uma versão que não existe de verdade — sem essa
@@ -1223,28 +1208,20 @@ fn main() -> anyhow::Result<()> {
             }
 
             if !yes {
-                let question = format!(
-                    "Isto vai remover IRREVOGAVELMENTE {} entrada(s) obsoleta(s) de \
-                     shortcuts.vdf (backup atômico automático antes). Nenhum dado remoto é \
-                     afetado.\n\nContinuar?",
-                    stale.len()
-                );
-                let confirmed = match display::confirm("vault-sync — prune-shortcuts", &question)
-                {
-                    Some(answer) => answer,
-                    None => {
-                        eprint!(
-                            "Isto vai remover IRREVOGAVELMENTE {} entrada(s) obsoleta(s) de \
-                             shortcuts.vdf. Digite 'sim' para confirmar: ",
-                            stale.len()
-                        );
-                        use std::io::Write as _;
-                        std::io::stderr().flush().ok();
-                        let mut answer = String::new();
-                        std::io::stdin().read_line(&mut answer)?;
-                        answer.trim().eq_ignore_ascii_case("sim")
-                    }
-                };
+                let confirmed = confirm_irrevocable(
+                    "vault-sync — prune-shortcuts",
+                    &format!(
+                        "Isto vai remover IRREVOGAVELMENTE {} entrada(s) obsoleta(s) de \
+                         shortcuts.vdf (backup atômico automático antes). Nenhum dado remoto é \
+                         afetado.\n\nContinuar?",
+                        stale.len()
+                    ),
+                    &format!(
+                        "Isto vai remover IRREVOGAVELMENTE {} entrada(s) obsoleta(s) de \
+                         shortcuts.vdf. Digite 'sim' para confirmar: ",
+                        stale.len()
+                    ),
+                )?;
                 if !confirmed {
                     anyhow::bail!("prune-shortcuts cancelado — confirmação não recebida");
                 }
@@ -1269,11 +1246,7 @@ fn main() -> anyhow::Result<()> {
             display::notify_result("vault-sync — prune-shortcuts concluído", &report, false);
         }
         Command::SetServerName { name } => {
-            let mut cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'set-server-name' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let mut cfg = require_config(cfg, "set-server-name")?;
             cfg.server_name = Some(name.clone());
             let config_path =
                 config::Config::resolve_path(cli.config.as_deref()).ok_or_else(|| {
@@ -1283,11 +1256,7 @@ fn main() -> anyhow::Result<()> {
             println!("[vault-sync] nome do servidor definido como '{name}'");
         }
         Command::SetClientName { name } => {
-            let mut cfg = cfg.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "'set-client-name' precisa de configuração válida (~/.config/vault-sync/config.json ou --config)"
-                )
-            })?;
+            let mut cfg = require_config(cfg, "set-client-name")?;
             cfg.client_name = Some(name.clone());
             let config_path =
                 config::Config::resolve_path(cli.config.as_deref()).ok_or_else(|| {
