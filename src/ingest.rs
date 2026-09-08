@@ -423,19 +423,6 @@ fn manifest_only_entries(
         .collect()
 }
 
-/// Pré-conta, mesmo critério de `manifest_only_entries`, pra somar ao
-/// total de progresso quando `--full` está ativo.
-fn count_matching_manifest_only_entries(
-    local_libraries: &[PathBuf],
-    only: Option<&str>,
-    excluded: &HashSet<String>,
-) -> usize {
-    local_libraries
-        .iter()
-        .map(|lib| manifest_only_entries(lib, only, excluded).len())
-        .sum()
-}
-
 /// Idem, pros títulos Heroic sob `heroic_local_root`.
 fn count_matching_heroic_entries(heroic_local_root: Option<&Path>, only: Option<&str>) -> usize {
     let Some(root) = heroic_local_root else {
@@ -495,15 +482,6 @@ fn pirata_manifest_only_entries(
         .collect()
 }
 
-fn count_matching_pirata_manifest_only_entries(
-    local_libraries: &[PathBuf],
-    piratas_overrides: &std::collections::HashMap<String, PathBuf>,
-    only: Option<&str>,
-    excluded: &HashSet<String>,
-) -> usize {
-    pirata_manifest_only_entries(local_libraries, piratas_overrides, only, excluded).len()
-}
-
 /// Títulos do `installed.json` do Legendary sem prefixo Wine
 /// correspondente em `heroic_local_root` — jogo Epic nativo Linux (nunca
 /// precisa do Wine, logo nunca gera prefixo) ou qualquer título nunca
@@ -524,17 +502,6 @@ fn epic_manifest_only_entries(
             !heroic_local_root.join(title).exists()
         })
         .collect()
-}
-
-fn count_matching_epic_manifest_only_entries(
-    heroic_local_root: Option<&Path>,
-    installed_json: Option<&Path>,
-    only: Option<&str>,
-) -> usize {
-    match (heroic_local_root, installed_json) {
-        (Some(root), Some(json)) => epic_manifest_only_entries(root, json, only).len(),
-        _ => 0,
-    }
 }
 
 /// Apaga o compatdata (+ manifesto, se presente) local de `targets`, só
@@ -618,18 +585,24 @@ fn run_ingest_with_options(
     let total_items = count_matching_steam_entries(&cfg.local_libraries, only, &excluded_steam)
         + count_matching_heroic_entries(cfg.heroic_local_root.as_deref(), only)
         + if full {
-            count_matching_manifest_only_entries(&cfg.local_libraries, only, &excluded_steam)
-                + count_matching_pirata_manifest_only_entries(
+            cfg.local_libraries
+                .iter()
+                .map(|lib| manifest_only_entries(lib, only, &excluded_steam).len())
+                .sum::<usize>()
+                + pirata_manifest_only_entries(
                     &cfg.local_libraries,
                     &cfg.install_path_overrides.piratas,
                     only,
                     &excluded_steam,
                 )
-                + count_matching_epic_manifest_only_entries(
+                .len()
+                + match (
                     cfg.heroic_local_root.as_deref(),
                     legendary_installed_json.as_deref(),
-                    only,
-                )
+                ) {
+                    (Some(root), Some(json)) => epic_manifest_only_entries(root, json, only).len(),
+                    _ => 0,
+                }
         } else {
             0
         };

@@ -19,6 +19,16 @@ pub struct LibraryCheck {
     pub is_mount_point: bool,
 }
 
+impl LibraryCheck {
+    fn for_path(path: &Path) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            exists: path.is_dir(),
+            is_mount_point: is_mount_point(path),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteCheck {
     pub ssh_target: String,
@@ -104,11 +114,7 @@ fn run_doctor_with_options(cfg: &Config, ssh_bin: &str, steam_root: Option<&Path
     let libraries = cfg
         .local_libraries
         .iter()
-        .map(|path| LibraryCheck {
-            path: path.clone(),
-            exists: path.is_dir(),
-            is_mount_point: is_mount_point(path),
-        })
+        .map(|path| LibraryCheck::for_path(path))
         .collect();
 
     let reachable = remote::check_connectivity(ssh_bin, &cfg.remote_ssh_target).is_ok();
@@ -124,11 +130,7 @@ fn run_doctor_with_options(cfg: &Config, ssh_bin: &str, steam_root: Option<&Path
                 })
                 .and_then(Result::ok);
             Some(HeroicCheck {
-                local_root: LibraryCheck {
-                    path: local_root.clone(),
-                    exists: local_root.is_dir(),
-                    is_mount_point: is_mount_point(local_root),
-                },
+                local_root: LibraryCheck::for_path(local_root),
                 remote_base_path: remote_base_path.clone(),
                 remote_base_path_status,
             })

@@ -39,6 +39,21 @@ fn shell_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
+/// Traduz um código de saída não-zero (ou encerramento por sinal) em
+/// `RemoteError` — `None` significa sucesso (código 0). Quem chama decide o
+/// que fazer com o sucesso: nem sempre é só `Ok(())` (ver `read_remote_file`,
+/// que ainda trata um código específico à parte como "arquivo ausente").
+fn nonzero_exit_error(status: &std::process::ExitStatus, stderr: &[u8]) -> Option<RemoteError> {
+    match status.code() {
+        Some(0) => None,
+        Some(code) => Some(RemoteError::NonZeroExit(
+            code,
+            String::from_utf8_lossy(stderr).into_owned(),
+        )),
+        None => Some(RemoteError::KilledBySignal),
+    }
+}
+
 /// Monta o `Command` base compartilhado por todas as chamadas SSH deste
 /// módulo. `ConnectTimeout` evita travar indefinidamente se o FeuVault
 /// estiver desligado/inacessível; `BatchMode=yes` desliga qualquer prompt
@@ -104,13 +119,9 @@ pub fn remove_remote_path(
         .output()
         .map_err(|e| RemoteError::Spawn(ssh_bin.to_string(), e))?;
 
-    match output.status.code() {
-        Some(0) => Ok(()),
-        Some(code) => Err(RemoteError::NonZeroExit(
-            code,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )),
-        None => Err(RemoteError::KilledBySignal),
+    match nonzero_exit_error(&output.status, &output.stderr) {
+        None => Ok(()),
+        Some(e) => Err(e),
     }
 }
 
@@ -122,13 +133,9 @@ pub fn check_connectivity(ssh_bin: &str, ssh_target: &str) -> Result<(), RemoteE
         .output()
         .map_err(|e| RemoteError::Spawn(ssh_bin.to_string(), e))?;
 
-    match output.status.code() {
-        Some(0) => Ok(()),
-        Some(code) => Err(RemoteError::NonZeroExit(
-            code,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )),
-        None => Err(RemoteError::KilledBySignal),
+    match nonzero_exit_error(&output.status, &output.stderr) {
+        None => Ok(()),
+        Some(e) => Err(e),
     }
 }
 
@@ -213,18 +220,14 @@ pub fn read_remote_file(
         .output()
         .map_err(|e| RemoteError::Spawn(ssh_bin.to_string(), e))?;
 
-    match output.status.code() {
-        Some(0) => {
-            let stdout = String::from_utf8(output.stdout).map_err(|_| RemoteError::InvalidUtf8)?;
-            Ok(Some(stdout))
-        }
-        Some(REMOTE_FILE_MISSING_CODE) => Ok(None),
-        Some(code) => Err(RemoteError::NonZeroExit(
-            code,
-            String::from_utf8_lossy(&output.stderr).into_owned(),
-        )),
-        None => Err(RemoteError::KilledBySignal),
+    if output.status.code() == Some(REMOTE_FILE_MISSING_CODE) {
+        return Ok(None);
     }
+    if let Some(e) = nonzero_exit_error(&output.status, &output.stderr) {
+        return Err(e);
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| RemoteError::InvalidUtf8)?;
+    Ok(Some(stdout))
 }
 
 /// Classifica um caminho remoto: ausente, diretório comum, ou ponto de
