@@ -1,0 +1,22 @@
+[package]
+name = "vault-sync"
+version = "0.1.0"
+edition = "2021"
+description = "Transforma o SSD local em zona de alocação efêmera para jogos, sincronizando com FeuVault."
+
+[dependencies]
+clap = { version = "=4.5.4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+dirs = "5"
+regex = "1"
+ureq = { version = "2", features = ["tls"] }
+crc32fast = "1"
+
+[profile.release]
+opt-level = 3
+lto = true

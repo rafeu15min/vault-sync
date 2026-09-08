@@ -1,0 +1,37 @@
+# Diagnóstico de boot — pendência levantada junto com a Fase VI: rodar
+# `doctor` uma vez a cada boot do Rafeu-PC, só pra deixar registrado no
+# journal se as bibliotecas locais/FeuVault estão OK antes do primeiro uso
+# do dia. NÃO é instalado nem habilitado automaticamente — artefato manual,
+# igual ao vault-sync-flush.service. Para instalar:
+#
+#   sudo cp systemd/vault-sync-doctor-boot.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable vault-sync-doctor-boot.service
+#
+# `doctor` é deliberadamente só-leitura e nunca acorda o FeuVault (ver
+# README, seção "Robustez adicional") — se o FeuVault estiver desligado no
+# boot (caso comum), a unit só reporta "SSH inalcançável" no journal
+# (`journalctl -u vault-sync-doctor-boot.service`) e sai com código
+# não-zero. Isso NUNCA bloqueia o boot: é `Type=oneshot` sem nada que
+# dependa dela via `Requires=`, então uma falha aqui só fica registrada,
+# não propaga.
+#
+# Mesma exigência de autenticação do vault-sync-flush.service: precisa da
+# chave sem passphrase `~/.ssh/vault_sync_ed25519` (IdentityFile extra em
+# `Host meuserver`, ver memória project_ssh_agent_keychain) — não há
+# terminal/agente disponível nesse estágio do boot.
+
+[Unit]
+Description=vault-sync — diagnóstico pré-voo (doctor) a cada boot
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vault-sync doctor
+User=rafeu
+Group=rafeu
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,21 @@
+{
+  "remote_ssh_target": "feuvault",
+  "remote_base_path": "/mnt/vault/steam-library",
+  "local_libraries": [
+    "/mnt/SSD2/SteamLibrary",
+    "/mnt/HDD1/SteamLibrary"
+  ],
+  "heroic_local_root": "/home/rafeu/Games/Heroic/Prefixes/default",
+  "heroic_remote_base_path": "/mnt/vault/heroic-prefixes",
+  "local_game_root_steam": "/home/rafeu/Games/steam",
+  "local_game_root_piratas": "/home/rafeu/Games/piratas",
+  "local_game_root_epic": "/home/rafeu/Games/epic",
+  "remote_installs_base_path": "/mnt/vault/game-installs",
+  "server_name": "FeuVault",
+  "client_name": "ThinClient",
+  "install_path_overrides": {
+    "steam": {},
+    "piratas": {},
+    "epic": {}
+  }
+}

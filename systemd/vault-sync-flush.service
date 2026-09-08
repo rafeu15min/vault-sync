@@ -1,0 +1,47 @@
+# Fase V (5.2) — "Suspensão Operacional via Unidades de Encerramento".
+#
+# NÃO é instalado nem habilitado automaticamente pelo vault-sync — é um
+# artefato manual. Para instalar:
+#
+#   sudo cp systemd/vault-sync-flush.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable vault-sync-flush.service
+#
+# User=/Group= já preenchidos para rafeu@Rafeu-PC. `ingest` roda sem
+# terminal/agente de sessão nenhum (o systemd derruba tudo isso no
+# shutdown), então a autenticação SSH aqui depende de uma chave SEM
+# passphrase dedicada a automação — `~/.ssh/vault_sync_ed25519`, registrada
+# como IdentityFile extra no `Host meuserver` de `~/.ssh/config` (ver
+# memória project_ssh_agent_keychain). A chave pessoal com passphrase
+# (`id_ed25519`, usada no terminal interativo via keychain) nunca funciona
+# aqui, e não deveria — não há como digitar senha num ExecStop.
+#
+# Mecanismo: ExecStart é um no-op (RemainAfterExit mantém a unit "ativa"
+# sem consumir recursos); todo o trabalho acontece em ExecStop, disparado
+# quando o systemd começa a parar a unit — o que acontece automaticamente
+# ao entrar em shutdown.target/reboot.target/halt.target por causa de
+# `Before=`. Isso implementa exatamente o requisito da spec: o comando de
+# desligamento encerra a sessão gráfica imediatamente, mas a máquina só
+# termina de fato de desligar depois que o `ingest` confirma (ou até o
+# TimeoutStopSec estourar). TimeoutStopSec é obrigatório e finito — é a
+# mitigação da spec para o risco de obstrução perene do desligamento: uma
+# falha de rede trava a ingestão por no máximo esse tempo, nunca para
+# sempre.
+
+[Unit]
+Description=vault-sync — finaliza sincronizações pendentes com o FeuVault antes do desligamento
+DefaultDependencies=no
+Before=shutdown.target reboot.target halt.target
+Conflicts=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/usr/local/bin/vault-sync ingest --background
+TimeoutStopSec=120
+User=rafeu
+Group=rafeu
+
+[Install]
+WantedBy=multi-user.target
