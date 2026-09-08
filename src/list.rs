@@ -141,16 +141,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-list-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::test_dir("list", label)
     }
 
     fn fake_ssh(dir: &std::path::Path, body: &str) -> std::path::PathBuf {

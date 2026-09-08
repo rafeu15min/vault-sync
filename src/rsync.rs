@@ -245,9 +245,6 @@ impl RsyncTransfer {
 mod tests {
     use super::*;
     use std::fs;
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn full_download_args_have_correct_direction_and_no_compression() {
@@ -324,27 +321,8 @@ mod tests {
     }
 
     fn fake_script(body: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("vault-sync-rsync-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(format!("fake-rsync-{}.sh", uuid_like()));
-        let mut f = fs::File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\n{body}").unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
-    }
-
-    fn uuid_like() -> String {
-        format!(
-            "{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-        .replace(['(', ')', ' '], "")
+        let dir = crate::testutil::test_dir("rsync", "fake-script");
+        crate::testutil::write_script(&dir, "fake-rsync.sh", body)
     }
 
     #[test]

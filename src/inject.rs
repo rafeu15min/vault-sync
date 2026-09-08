@@ -114,7 +114,7 @@ fn inject_launch_options(fields: &mut VdfObject, app_id: &str) -> bool {
 pub fn inject_all_shortcuts(
     steam_root: &Path,
 ) -> Vec<(PathBuf, Result<InjectionSummary, InjectError>)> {
-    scan::for_each_userdata_file(steam_root, "shortcuts.vdf", |p| inject_shortcuts_file(p))
+    scan::for_each_userdata_file(steam_root, "shortcuts.vdf", inject_shortcuts_file)
 }
 
 /// Varre um `localconfig.vdf` específico e injeta `vault-sync run <appid>
@@ -354,16 +354,7 @@ mod tests {
     use std::fs;
 
     fn test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-inject-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::test_dir("inject", label)
     }
 
     fn shortcut_tree(launch_options: Option<&str>) -> VdfObject {

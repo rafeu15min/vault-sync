@@ -990,40 +990,14 @@ fn cleanup_local(targets: &LocalDeletionTargets, keep_manifest: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{self, File};
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-session-test-{label}-{}-{}",
-            std::process::id(),
-            unique_suffix()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    fn unique_suffix() -> String {
-        format!(
-            "{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )
-        .replace(['(', ')', ' '], "")
+        crate::testutil::test_dir("session", label)
     }
 
     fn write_script(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
-        let path = dir.join(name);
-        let mut f = File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\n{body}").unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        crate::testutil::write_script(dir, name, body)
     }
 
     /// rsync sempre bem-sucedido, sem copiar nada de fato — usado nos testes

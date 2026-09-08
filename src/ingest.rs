@@ -1453,31 +1453,14 @@ fn run_ingest_with_options(
 mod tests {
     use super::*;
     use crate::vdf::VdfValue;
-    use std::fs::{self, File};
-    use std::io::Write;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-ingest-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::test_dir("ingest", label)
     }
 
     fn fake_bin(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
-        let path = dir.join(name);
-        let mut f = File::create(&path).unwrap();
-        writeln!(f, "#!/bin/sh\n{body}").unwrap();
-        #[cfg(unix)]
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        path
+        crate::testutil::write_script(dir, name, body)
     }
 
     fn cfg_with_lib(local_lib: &std::path::Path) -> Config {

@@ -38,16 +38,7 @@ mod tests {
     use std::fs;
 
     fn test_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-backup-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::test_dir("backup", label)
     }
 
     #[test]

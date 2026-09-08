@@ -272,16 +272,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn test_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "vault-sync-remote-test-{label}-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::testutil::test_dir("remote", label)
     }
 
     /// Simula o `ssh <target> <comando>` real: como o binário fake não é o

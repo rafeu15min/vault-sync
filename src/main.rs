@@ -31,6 +31,8 @@ mod scan;
 mod session;
 mod steam_appid;
 mod steam_catalog;
+#[cfg(test)]
+mod testutil;
 mod text_vdf;
 mod update;
 mod vdf;
