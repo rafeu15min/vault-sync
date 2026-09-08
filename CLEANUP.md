@@ -4,13 +4,11 @@
 > funcionalmente completa e estável (Fases I-VII + universalização de
 > nomes). Objetivo: "menos é mais" — identificar código morto, duplicação
 > mecânica e oportunidades de simplificação, sem tocar em nenhuma proteção
-> ligada a incidente real documentado. Nada deste arquivo foi executado
-> ainda — é só o plano, pra execução futura.
+> ligada a incidente real documentado.
 >
-> **Antes de executar qualquer camada abaixo**: este projeto não tem
-> controle de versão (`git init` nunca foi feito). Inicialize um repositório
-> git com um commit do estado atual antes de tocar em qualquer coisa aqui —
-> mesmo a Camada 1, que é mecânica, merece um jeito seguro de reverter.
+> **Status (2026-09-08)**: git inicializado (commit `15f99cf`, baseline
+> pré-limpeza). **Camada 1 executada e commitada** — ver commit seguinte.
+> Camadas 2-4 continuam como plano, pra execução futura.
 
 ## Como isso foi levantado
 

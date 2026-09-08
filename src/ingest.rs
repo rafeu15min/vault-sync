@@ -241,7 +241,7 @@ fn upload_manifest_snapshot(
 /// `legendary launch` reconhecer como instalado — o `installed.json`
 /// nunca soube da instalação completa que o vault-sync acabou de trazer
 /// de volta, mesmo com os arquivos certinhos no disco. Ver o restaurador
-/// em `session::ensure_legendary_knows_about_install`.
+/// em `session::ensure_legendary_knows_about_install_at`.
 ///
 /// Melhor esforço deliberado: sem `installed.json` local (Heroic nunca
 /// usado nesta máquina) ou falha de rede, só um aviso — nunca derruba o
@@ -1174,7 +1174,7 @@ fn run_ingest_with_options(
 
         // Retrato do `installed.json` inteiro do Legendary, uma vez por
         // `ingest` (não por título) — ver `upload_legendary_installed_json_snapshot`
-        // e o restaurador em `session::ensure_legendary_knows_about_install`.
+        // e o restaurador em `session::ensure_legendary_knows_about_install_at`.
         if full {
             if let Some(remote_installs) = &cfg.remote_installs_base_path {
                 upload_legendary_installed_json_snapshot(

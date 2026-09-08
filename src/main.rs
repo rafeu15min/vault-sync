@@ -8,7 +8,6 @@
 // systemd de suspensão de encerramento (5.2) é um artefato à parte —
 // `systemd/vault-sync-flush.service` — instalada manualmente pelo usuário,
 // nunca por este binário.
-#![allow(dead_code)]
 
 mod backup;
 mod catalog;

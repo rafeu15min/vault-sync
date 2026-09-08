@@ -12,7 +12,6 @@
 //! confirmar `Path::is_dir()` primeiro — o valor gravado no metadado é só
 //! um candidato, nunca a fonte de verdade final.
 
-use crate::scan;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -229,28 +228,6 @@ pub fn resolve_official_install_dir(
     verified_candidate(candidate)
 }
 
-/// Steam pirata (atalho non-Steam): idem, `override_path` primeiro (vindo
-/// de `install_path_overrides.piratas`), senão lê `StartDir` do
-/// `shortcuts.vdf` que contém `app_id` (via
-/// `scan::find_shortcut_start_dir`) e verifica se esse caminho existe de
-/// verdade. `None` tanto quando não há atalho correspondente quanto
-/// quando o `StartDir` gravado aponta pra um caminho morto — os dois
-/// casos são "não verificável", quem chama decide como reportar a
-/// diferença (hoje não precisa: ambos significam "pule este jogo, não
-/// invente um caminho").
-pub fn resolve_shortcut_install_dir(
-    steam_root: &Path,
-    app_id: u32,
-    override_path: Option<&Path>,
-) -> Option<PathBuf> {
-    if let Some(dir) = verified_override(override_path) {
-        return Some(dir);
-    }
-    let start_dir = scan::find_shortcut_start_dir(steam_root, app_id)?;
-    let candidate = PathBuf::from(start_dir);
-    verified_candidate(candidate)
-}
-
 /// Caminho convencional do `installed.json` do Legendary (backend do
 /// Heroic) — não configurável, mesmo precedente de `scan::find_steam_root`
 /// pros caminhos convencionais da Steam.
@@ -377,7 +354,6 @@ pub fn remove_legendary_installed_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vdf::{self, VdfValue};
     use std::fs;
 
     fn test_dir(label: &str) -> PathBuf {
@@ -634,64 +610,6 @@ mod tests {
         );
     }
 
-    fn shortcuts_tree_with_start_dir(app_id: u32, start_dir: &str) -> vdf::VdfObject {
-        vec![(
-            "shortcuts".to_string(),
-            VdfValue::Object(vec![(
-                "0".to_string(),
-                VdfValue::Object(vec![
-                    ("appid".to_string(), VdfValue::Int(app_id as i32)),
-                    ("appname".to_string(), VdfValue::Str("Jogo".to_string())),
-                    (
-                        "StartDir".to_string(),
-                        VdfValue::Str(format!("\"{start_dir}\"")),
-                    ),
-                ]),
-            )]),
-        )]
-    }
-
-    #[test]
-    fn shortcut_install_dir_resolves_when_start_dir_exists_on_disk() {
-        let dir = test_dir("shortcut-ok");
-        let steam_root = dir.join("steam");
-        let userdata = steam_root.join("userdata").join("1").join("config");
-        fs::create_dir_all(&userdata).unwrap();
-        let install_dir = dir.join("Piratas").join("Jogo");
-        fs::create_dir_all(&install_dir).unwrap();
-        fs::write(
-            userdata.join("shortcuts.vdf"),
-            vdf::write_binary(&shortcuts_tree_with_start_dir(
-                42,
-                install_dir.to_str().unwrap(),
-            )),
-        )
-        .unwrap();
-
-        let resolved = resolve_shortcut_install_dir(&steam_root, 42, None).unwrap();
-        assert_eq!(resolved, install_dir);
-    }
-
-    #[test]
-    fn shortcut_install_dir_is_none_when_start_dir_no_longer_exists() {
-        let dir = test_dir("shortcut-stale");
-        let steam_root = dir.join("steam");
-        let userdata = steam_root.join("userdata").join("1").join("config");
-        fs::create_dir_all(&userdata).unwrap();
-        // Reproduz o caso real: StartDir aponta pra um HD externo
-        // desmontado (`/run/media/...`), nunca criado aqui de propósito.
-        fs::write(
-            userdata.join("shortcuts.vdf"),
-            vdf::write_binary(&shortcuts_tree_with_start_dir(
-                42,
-                "/run/media/rafeu/SSD/Piratas/Jogo",
-            )),
-        )
-        .unwrap();
-
-        assert!(resolve_shortcut_install_dir(&steam_root, 42, None).is_none());
-    }
-
     #[test]
     fn legendary_install_path_resolves_when_title_matches_and_folder_exists() {
         let dir = test_dir("legendary-ok");
@@ -759,39 +677,6 @@ mod tests {
         .unwrap();
 
         assert!(resolve_legendary_install_path(&installed_json, "Hogwarts Legacy", None).is_none());
-    }
-
-    #[test]
-    #[ignore = "validação manual contra dados reais desta máquina, não roda em CI"]
-    fn real_machine_legendary_install_path_matches_known_state() {
-        let installed_json =
-            Path::new("/home/rafeu/.config/heroic/legendaryConfig/legendary/installed.json");
-        // Durante a Fase VII, a instalação do Disco Elysium se moveu de
-        // /mnt/SSD2/Epic/ pra /mnt/HDD1/EPIC/ NO MEIO da sessão de
-        // trabalho, sem o installed.json ser atualizado — prova real (não
-        // hipotética) de por que este módulo nunca confia num caminho
-        // gravado sem checar o disco primeiro. Os 4 `install_path` foram
-        // corrigidos manualmente em 2026-08-14 (backup em
-        // installed.json.vault-sync-bak) pra refletir a localização real
-        // atual — se este teste falhar, é sinal de que algum jogo mudou de
-        // disco de novo e o `install_path` precisa ser corrigido outra vez.
-        for (title, expected) in [
-            (
-                "Disco Elysium - The Final Cut",
-                "/mnt/HDD1/EPIC/DiscoElysium",
-            ),
-            ("Nobody Wants to Die", "/mnt/SSD2/Epic/NobodyWantsToDie"),
-            ("Chivalry 2", "/mnt/SSD2/Epic/Chivalry2"),
-            ("Hogwarts Legacy", "/mnt/SSD2/Epic/HogwartsLegacy"),
-        ] {
-            assert_eq!(
-                resolve_legendary_install_path(installed_json, title, None),
-                Some(PathBuf::from(expected)),
-                "esperava '{title}' resolver pra '{expected}' — se isso falhar, o jogo \
-                 provavelmente mudou de disco de novo (já aconteceu antes nesta mesma \
-                 máquina) e o install_path precisa ser corrigido"
-            );
-        }
     }
 
     #[test]
@@ -913,27 +798,6 @@ mod tests {
         let deep = test_dir("deep-ok").join("Piratas").join("Jogo");
         fs::create_dir_all(&deep).unwrap();
         assert!(is_safe_install_dir(&deep, None));
-    }
-
-    #[test]
-    fn shortcut_install_dir_refuses_start_dir_equal_to_real_home_dir() {
-        // Reproduz o incidente de ponta a ponta: StartDir gravado no
-        // shortcuts.vdf aponta pro $HOME de verdade de quem roda o teste.
-        let home = dirs::home_dir().expect("teste exige $HOME resolvível");
-        let dir = test_dir("shortcut-home-incident");
-        let steam_root = dir.join("steam");
-        let userdata = steam_root.join("userdata").join("1").join("config");
-        fs::create_dir_all(&userdata).unwrap();
-        fs::write(
-            userdata.join("shortcuts.vdf"),
-            vdf::write_binary(&shortcuts_tree_with_start_dir(42, home.to_str().unwrap())),
-        )
-        .unwrap();
-
-        assert!(
-            resolve_shortcut_install_dir(&steam_root, 42, None).is_none(),
-            "StartDir apontando pro $HOME nunca deveria resolver pra um install_dir"
-        );
     }
 
     #[test]

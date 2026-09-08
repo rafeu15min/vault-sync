@@ -1,6 +1,5 @@
 use serde::Serialize;
 use std::path::PathBuf;
-use std::time::SystemTime;
 
 /// Classifica a origem de um jogo, replicando a heurística já validada em
 /// `steam_scan.py`:
@@ -122,17 +121,13 @@ impl LibraryLocation {
 #[derive(Debug, Clone)]
 pub struct GameSession {
     pub source: GameSource,
-    pub library: LibraryLocation,
-    pub started_at: Option<SystemTime>,
     pub child_pid: Option<u32>,
 }
 
 impl GameSession {
-    pub fn new(source: GameSource, library: LibraryLocation) -> Self {
+    pub fn new(source: GameSource) -> Self {
         Self {
             source,
-            library,
-            started_at: None,
             child_pid: None,
         }
     }

@@ -8,7 +8,7 @@ use crate::rsync::{RsyncTransfer, TransferError};
 use crate::scan;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// Alvos de sincronização da *instalação completa* de um jogo (Fase VII) —
 /// paralelo a `local_targets`/`remote_paths` (que continuam só sobre
@@ -255,21 +255,11 @@ fn restore_official_manifest_snapshot(
 /// corrompido, sem permissão de escrita): nunca derruba a sessão, só
 /// registra um aviso — o `legendary launch` que vem a seguir reporta seu
 /// próprio erro claro se isso não bastar pra resolver.
-fn ensure_legendary_knows_about_install(
-    cfg: &Config,
-    title: &str,
-    local_dir: &Path,
-    ssh_bin: &str,
-) {
-    let Some(installed_json_path) = install_paths::default_legendary_installed_json_path() else {
-        return;
-    };
-    ensure_legendary_knows_about_install_at(cfg, title, local_dir, ssh_bin, &installed_json_path);
-}
-
-/// Núcleo testável de `ensure_legendary_knows_about_install`:
+///
 /// `installed_json_path` injetado em vez de sempre resolver o caminho
-/// real do sistema (`dirs::config_dir()`, não redirecionável em teste).
+/// real do sistema (`dirs::config_dir()`, não redirecionável em teste) —
+/// chamadores reais resolvem via `install_paths::
+/// default_legendary_installed_json_path()`.
 fn ensure_legendary_knows_about_install_at(
     cfg: &Config,
     title: &str,
@@ -357,15 +347,14 @@ fn write_legendary_installed_json(
 
 /// Contexto resolvido de uma sessão: quem/onde, já com compatdata +
 /// instalação completa (se rastreada) garantidos localmente — baixados do
-/// FeuVault quando faltando. Extraído de `run_session_with_options` pra ser
-/// reaproveitado por `ensure_local_ready_with_options`, que precisa do
-/// mesmo "traz de volta se faltar" sem o resto do ciclo (spawnar/esperar/
-/// subir/limpar) — caso de jogos Steam oficiais lançados via `steam
-/// -applaunch` pelo menu, onde não dá pra supervisionar o processo real
-/// (ver `dispatch_run`/`MenuLaunch` em `main.rs`).
+/// FeuVault quando faltando. Compartilhado pelas duas variantes de ciclo de
+/// vida que precisam desse "traz de volta se faltar": `run_session_with_
+/// options` (spawna e supervisiona o processo direto) e
+/// `run_via_steam_applaunch_with_options` (jogos Steam oficiais lançados
+/// via `steam -applaunch` pelo menu, onde não dá pra supervisionar o
+/// processo real — ver `dispatch_run`/`MenuLaunch` em `main.rs`).
 struct ResolvedSession {
     source: GameSource,
-    library: LibraryLocation,
     vault: RemoteVault,
     remote_paths: crate::paths::RemotePaths,
     local_targets: LocalDeletionTargets,
@@ -536,40 +525,12 @@ fn resolve_and_download(
 
     Ok(ResolvedSession {
         source,
-        library,
         vault,
         remote_paths,
         local_targets,
         full_install,
         _lock,
     })
-}
-
-/// Garante que compatdata + instalação completa (se rastreada) de
-/// `app_id`/`launcher` estejam presentes localmente — baixando do FeuVault
-/// o que faltar — sem spawnar nada nem esperar um jogo fechar. Não
-/// sincroniza de volta nem limpa nada: é só a metade "traz de volta" do
-/// ciclo completo de `run_session`, pro caso em que a outra metade (esperar
-/// o jogo fechar) não dá pra fazer com segurança (`steam -applaunch`, ver
-/// `dispatch_run` em `main.rs`).
-pub fn ensure_local_ready(
-    cfg: &Config,
-    launcher: Launcher,
-    app_id: &str,
-    steam_root: Option<&Path>,
-    on_progress: impl FnMut(Stage, ProgressUpdate),
-) -> Result<(), RunError> {
-    resolve_and_download(
-        cfg,
-        launcher,
-        app_id,
-        steam_root,
-        "rsync",
-        "ssh",
-        &LockGuard::default_path(),
-        on_progress,
-    )?;
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,7 +548,6 @@ fn run_session_with_options(
 ) -> Result<GameSession, RunError> {
     let ResolvedSession {
         source,
-        library,
         vault,
         remote_paths,
         local_targets,
@@ -606,8 +566,7 @@ fn run_session_with_options(
 
     let (program, args) = exec.split_first().ok_or(RunError::EmptyExecCommand)?;
 
-    let mut session = GameSession::new(source, library);
-    session.started_at = Some(SystemTime::now());
+    let mut session = GameSession::new(source);
 
     // 3.1: `Command` herda todo o ambiente do processo pai por padrão (sem
     // `.env_clear()`), garantindo que DISPLAY/WAYLAND_DISPLAY/XAUTHORITY e
@@ -651,7 +610,7 @@ fn run_session_with_options(
     }
     // Só pra Heroic, e só quando há instalação completa rastreada (sem
     // isso não sabemos qual `install_path` o Legendary deveria ter) —
-    // ver `ensure_legendary_knows_about_install` pra por quê.
+    // ver `ensure_legendary_knows_about_install_at` pra por quê.
     if launcher == Launcher::Heroic {
         if let (Some(full), Some(installed_json)) = (&full_install, legendary_installed_json_path) {
             ensure_legendary_knows_about_install_at(
@@ -765,7 +724,7 @@ fn upload_and_cleanup(
             // até o próximo `ingest --full` limpar, mesmo já 100%
             // sincronizado de volta (incidente real, 2026-09-07). Melhor
             // esforço deliberado (só aviso, nunca falha o `run`): o próximo
-            // `run` já repara sozinho via `ensure_legendary_knows_about_install`,
+            // `run` já repara sozinho via `ensure_legendary_knows_about_install_at`,
             // então uma falha aqui não compromete o próximo lançamento, só
             // a exibição do catálogo até lá.
             if let (GameSource::HeroicGame { title }, Some(installed_json)) =
@@ -785,7 +744,7 @@ fn upload_and_cleanup(
 /// injetado em vez de sempre resolver o caminho real do sistema
 /// (`dirs::config_dir()`, não redirecionável em teste). Melhor esforço
 /// deliberado (só aviso, nunca propaga erro): o próximo `run` já repara
-/// sozinho via `ensure_legendary_knows_about_install`.
+/// sozinho via `ensure_legendary_knows_about_install_at`.
 pub(crate) fn clean_stale_legendary_entry_at(title: &str, installed_json_path: &Path) {
     if !installed_json_path.is_file() {
         return;
@@ -841,10 +800,6 @@ fn find_reaper_pid_in(proc_dir: &str, app_id: &str) -> Option<u32> {
 /// testável sem tocar em `/proc` de verdade.
 fn cmdline_has_marker(cmdline: &str, marker: &str) -> bool {
     cmdline.split('\0').any(|arg| arg == marker)
-}
-
-fn pid_is_alive(pid: u32) -> bool {
-    Path::new("/proc").join(pid.to_string()).exists()
 }
 
 /// Margem de segurança entre um `reaper` sumir e considerar a sessão
@@ -967,7 +922,6 @@ fn run_via_steam_applaunch_with_options(
 ) -> Result<GameSession, RunError> {
     let ResolvedSession {
         source,
-        library,
         vault,
         remote_paths,
         local_targets,
@@ -984,8 +938,7 @@ fn run_via_steam_applaunch_with_options(
         &mut on_progress,
     )?;
 
-    let mut session = GameSession::new(source, library);
-    session.started_at = Some(SystemTime::now());
+    let session = GameSession::new(source);
 
     Command::new("steam")
         .arg("-applaunch")
@@ -1190,14 +1143,6 @@ mod tests {
     fn find_reaper_pid_returns_none_when_no_session_is_running() {
         let dir = test_dir("proc-find-reaper-empty");
         assert_eq!(find_reaper_pid_in(dir.to_str().unwrap(), "1091500"), None);
-    }
-
-    #[test]
-    fn pid_is_alive_reflects_real_proc_state() {
-        assert!(pid_is_alive(std::process::id()));
-        // PID acima do limite prático do kernel (2^22 em qualquer config
-        // real) — não deveria existir.
-        assert!(!pid_is_alive(4_194_304));
     }
 
     #[test]

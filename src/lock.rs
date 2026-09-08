@@ -91,10 +91,6 @@ impl LockGuard {
             .unwrap_or_else(std::env::temp_dir)
             .join("vault-sync.lock")
     }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for LockGuard {
@@ -126,9 +122,8 @@ mod tests {
         assert!(!path.exists());
 
         {
-            let guard = LockGuard::acquire(&path).unwrap();
+            let _guard = LockGuard::acquire(&path).unwrap();
             assert!(path.exists());
-            assert_eq!(guard.path(), path.as_path());
         }
 
         assert!(
