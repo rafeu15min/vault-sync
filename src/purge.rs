@@ -244,19 +244,9 @@ pub(crate) fn remove_shortcut_entries_everywhere(
     steam_root: &Path,
     app_id: u32,
 ) -> Vec<(PathBuf, Result<usize, ShortcutCleanupError>)> {
-    let userdata = steam_root.join("userdata");
-    let Ok(entries) = std::fs::read_dir(userdata) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path().join("config").join("shortcuts.vdf"))
-        .filter(|p| p.is_file())
-        .map(|p| {
-            let result = remove_shortcut_entries_in_file(&p, app_id);
-            (p, result)
-        })
-        .collect()
+    scan::for_each_userdata_file(steam_root, "shortcuts.vdf", |p| {
+        remove_shortcut_entries_in_file(p, app_id)
+    })
 }
 
 fn remove_shortcut_entries_in_file(

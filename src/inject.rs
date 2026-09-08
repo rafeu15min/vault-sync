@@ -114,19 +114,7 @@ fn inject_launch_options(fields: &mut VdfObject, app_id: &str) -> bool {
 pub fn inject_all_shortcuts(
     steam_root: &Path,
 ) -> Vec<(PathBuf, Result<InjectionSummary, InjectError>)> {
-    let userdata = steam_root.join("userdata");
-    let Ok(entries) = std::fs::read_dir(userdata) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path().join("config").join("shortcuts.vdf"))
-        .filter(|p| p.is_file())
-        .map(|p| {
-            let result = inject_shortcuts_file(&p);
-            (p, result)
-        })
-        .collect()
+    scan::for_each_userdata_file(steam_root, "shortcuts.vdf", |p| inject_shortcuts_file(p))
 }
 
 /// Varre um `localconfig.vdf` específico e injeta `vault-sync run <appid>
@@ -216,19 +204,9 @@ pub fn inject_all_official_launch_options(
     steam_root: &Path,
     tracked_app_ids: &[u32],
 ) -> Vec<(PathBuf, Result<InjectionSummary, InjectError>)> {
-    let userdata = steam_root.join("userdata");
-    let Ok(entries) = std::fs::read_dir(userdata) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .map(|e| e.path().join("config").join("localconfig.vdf"))
-        .filter(|p| p.is_file())
-        .map(|p| {
-            let result = inject_official_launch_options(&p, tracked_app_ids);
-            (p, result)
-        })
-        .collect()
+    scan::for_each_userdata_file(steam_root, "localconfig.vdf", |p| {
+        inject_official_launch_options(p, tracked_app_ids)
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

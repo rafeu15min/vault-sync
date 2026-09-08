@@ -114,21 +114,31 @@ fn read_shortcuts_vdf(path: &Path) -> Result<vdf::VdfObject, ()> {
     vdf::parse_binary(&raw).map_err(|_| ())
 }
 
-/// Extrai os pares (appid, appname) da árvore de um `shortcuts.vdf` já
-/// decodificado — usado tanto pelo catálogo quanto pelos testes do motor de
-/// injeção.
-pub(crate) fn shortcuts_from_tree(root: &vdf::VdfObject) -> Vec<(u32, String)> {
-    let mut out = Vec::new();
+/// Percorre as entradas de "shortcuts" de uma árvore de `shortcuts.vdf` já
+/// decodificada, entregando os campos de cada atalho pra `f` extrair o que
+/// precisar — base comum reaproveitada por todos os extratores
+/// especializados abaixo, que só variam no campo extraído.
+fn for_each_shortcut_entry(root: &vdf::VdfObject, mut f: impl FnMut(&vdf::VdfObject)) {
     let Some((_, VdfValue::Object(shortcuts))) = root
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("shortcuts"))
     else {
-        return out;
+        return;
     };
     for (_, entry) in shortcuts {
         let VdfValue::Object(fields) = entry else {
             continue;
         };
+        f(fields);
+    }
+}
+
+/// Extrai os pares (appid, appname) da árvore de um `shortcuts.vdf` já
+/// decodificado — usado tanto pelo catálogo quanto pelos testes do motor de
+/// injeção.
+pub(crate) fn shortcuts_from_tree(root: &vdf::VdfObject) -> Vec<(u32, String)> {
+    let mut out = Vec::new();
+    for_each_shortcut_entry(root, |fields| {
         let app_id = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("appid"))
@@ -146,7 +156,7 @@ pub(crate) fn shortcuts_from_tree(root: &vdf::VdfObject) -> Vec<(u32, String)> {
         if let (Some(app_id), Some(name)) = (app_id, name) {
             out.push((app_id, name));
         }
-    }
+    });
     out
 }
 
@@ -173,25 +183,41 @@ pub fn find_shortcut_exe(steam_root: &Path, app_id: u32) -> Option<String> {
     find_shortcut_field(steam_root, app_id, "exe")
 }
 
+/// Aplica `f` a cada `<steam_root>/userdata/*/config/<filename>` que existe
+/// de verdade (um por usuário local da Steam), coletando o par (caminho,
+/// resultado) — driver comum reaproveitado por qualquer operação que
+/// precise varrer os perfis locais um por um (injeção, remoção, busca).
+pub(crate) fn for_each_userdata_file<R>(
+    steam_root: &Path,
+    filename: &str,
+    mut f: impl FnMut(&Path) -> R,
+) -> Vec<(PathBuf, R)> {
+    let userdata = steam_root.join("userdata");
+    let Ok(entries) = fs::read_dir(userdata) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path().join("config").join(filename))
+        .filter(|p| p.is_file())
+        .map(|p| {
+            let result = f(&p);
+            (p, result)
+        })
+        .collect()
+}
+
 /// Procura, em todos os `shortcuts.vdf` locais, o campo `field_name`
 /// (comparação sem diferenciar maiúsculas) do atalho non-Steam que casa
 /// com `app_id`.
 fn find_shortcut_field(steam_root: &Path, app_id: u32, field_name: &str) -> Option<String> {
-    let userdata = steam_root.join("userdata");
-    let entries = fs::read_dir(userdata).ok()?;
-    for user_dir in entries.flatten() {
-        let vdf_path = user_dir.path().join("config").join("shortcuts.vdf");
-        let Ok(raw) = fs::read(&vdf_path) else {
-            continue;
-        };
-        let Ok(root) = vdf::parse_binary(&raw) else {
-            continue;
-        };
-        if let Some(value) = shortcut_field_from_tree(&root, app_id, field_name) {
-            return Some(value);
-        }
-    }
-    None
+    for_each_userdata_file(steam_root, "shortcuts.vdf", |path| {
+        let raw = fs::read(path).ok()?;
+        let root = vdf::parse_binary(&raw).ok()?;
+        shortcut_field_from_tree(&root, app_id, field_name)
+    })
+    .into_iter()
+    .find_map(|(_, result)| result)
 }
 
 /// Mesma árvore que `shortcuts_from_tree` percorre, mas extraindo o campo
@@ -202,32 +228,27 @@ fn shortcut_field_from_tree(
     app_id: u32,
     field_name: &str,
 ) -> Option<String> {
-    let (_, VdfValue::Object(shortcuts)) = root
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("shortcuts"))?
-    else {
-        return None;
-    };
-    for (_, entry) in shortcuts {
-        let VdfValue::Object(fields) = entry else {
-            continue;
-        };
+    let mut result = None;
+    for_each_shortcut_entry(root, |fields| {
+        if result.is_some() {
+            return;
+        }
         let matches_app_id = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("appid"))
             .is_some_and(|(_, v)| matches!(v, VdfValue::Int(i) if *i as u32 == app_id));
         if !matches_app_id {
-            continue;
+            return;
         }
-        return fields
+        result = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case(field_name))
             .and_then(|(_, v)| match v {
                 VdfValue::Str(s) => Some(s.trim_matches('"').to_string()),
                 _ => None,
             });
-    }
-    None
+    });
+    result
 }
 
 /// Procura, em todos os `shortcuts.vdf` locais, uma entrada cujo `appname`
@@ -240,50 +261,37 @@ fn shortcut_field_from_tree(
 /// `find_stale_shortcuts`, que detecta exatamente essas entradas obsoletas
 /// depois que uma nova é criada).
 pub fn find_shortcut_exe_by_name(steam_root: &Path, name: &str) -> Option<(PathBuf, String)> {
-    let userdata = steam_root.join("userdata");
-    let entries = fs::read_dir(userdata).ok()?;
-    for user_dir in entries.flatten() {
-        let vdf_path = user_dir.path().join("config").join("shortcuts.vdf");
-        let Ok(raw) = fs::read(&vdf_path) else {
-            continue;
-        };
-        let Ok(root) = vdf::parse_binary(&raw) else {
-            continue;
-        };
-        if let Some(exe) = exe_for_appname_from_tree(&root, name) {
-            return Some((vdf_path, exe));
-        }
-    }
-    None
+    for_each_userdata_file(steam_root, "shortcuts.vdf", |path| {
+        let raw = fs::read(path).ok()?;
+        let root = vdf::parse_binary(&raw).ok()?;
+        exe_for_appname_from_tree(&root, name)
+    })
+    .into_iter()
+    .find_map(|(path, result)| result.map(|exe| (path, exe)))
 }
 
 fn exe_for_appname_from_tree(root: &vdf::VdfObject, name: &str) -> Option<String> {
-    let (_, VdfValue::Object(shortcuts)) = root
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("shortcuts"))?
-    else {
-        return None;
-    };
-    for (_, entry) in shortcuts {
-        let VdfValue::Object(fields) = entry else {
-            continue;
-        };
+    let mut result = None;
+    for_each_shortcut_entry(root, |fields| {
+        if result.is_some() {
+            return;
+        }
         let matches_name = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("appname"))
             .is_some_and(|(_, v)| matches!(v, VdfValue::Str(s) if s == name));
         if !matches_name {
-            continue;
+            return;
         }
-        return fields
+        result = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("exe"))
             .and_then(|(_, v)| match v {
                 VdfValue::Str(s) => Some(s.trim_matches('"').to_string()),
                 _ => None,
             });
-    }
-    None
+    });
+    result
 }
 
 /// Uma entrada de `shortcuts.vdf` cujo `Exe` não existe mais em disco, mas
@@ -306,20 +314,15 @@ pub struct StaleShortcut {
 }
 
 pub fn find_stale_shortcuts(steam_root: &Path) -> Vec<StaleShortcut> {
-    let userdata = steam_root.join("userdata");
     let mut by_name: HashMap<String, Vec<(u32, String)>> = HashMap::new();
-    let Ok(entries) = fs::read_dir(userdata) else {
-        return Vec::new();
-    };
-    for user_dir in entries.flatten() {
-        let vdf_path = user_dir.path().join("config").join("shortcuts.vdf");
-        let Ok(raw) = fs::read(&vdf_path) else {
-            continue;
-        };
-        let Ok(root) = vdf::parse_binary(&raw) else {
-            continue;
-        };
-        for (app_id, name, exe) in shortcuts_with_exe_from_tree(&root) {
+    for (_, entries_in_file) in for_each_userdata_file(steam_root, "shortcuts.vdf", |path| {
+        fs::read(path)
+            .ok()
+            .and_then(|raw| vdf::parse_binary(&raw).ok())
+            .map(|root| shortcuts_with_exe_from_tree(&root))
+            .unwrap_or_default()
+    }) {
+        for (app_id, name, exe) in entries_in_file {
             let bucket = by_name.entry(name).or_default();
             if !bucket.iter().any(|(id, _)| *id == app_id) {
                 bucket.push((app_id, exe));
@@ -353,16 +356,7 @@ pub fn find_stale_shortcuts(steam_root: &Path) -> Vec<StaleShortcut> {
 
 fn shortcuts_with_exe_from_tree(root: &vdf::VdfObject) -> Vec<(u32, String, String)> {
     let mut out = Vec::new();
-    let Some((_, VdfValue::Object(shortcuts))) = root
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("shortcuts"))
-    else {
-        return out;
-    };
-    for (_, entry) in shortcuts {
-        let VdfValue::Object(fields) = entry else {
-            continue;
-        };
+    for_each_shortcut_entry(root, |fields| {
         let app_id = fields
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("appid"))
@@ -387,7 +381,7 @@ fn shortcuts_with_exe_from_tree(root: &vdf::VdfObject) -> Vec<(u32, String, Stri
         if let (Some(app_id), Some(name), Some(exe)) = (app_id, name, exe) {
             out.push((app_id, name, exe));
         }
-    }
+    });
     out
 }
 
