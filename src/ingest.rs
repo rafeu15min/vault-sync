@@ -653,6 +653,111 @@ fn run_ingest_with_options(
     // não migrado é a única fonte pra resolvê-la) pelo primeiro laço, a
     // resolução falha de novo e o jogo aparece falsamente em
     // `full_skipped`, mesmo tendo sido migrado com sucesso segundos antes.
+    let processed_steam_app_ids = run_steam_compatdata_pass(
+        cfg,
+        full,
+        and_purge_local,
+        only,
+        rsync_bin,
+        &shortcuts_names,
+        &excluded_steam,
+        &vault,
+        &full_install_remote,
+        &remote_entries,
+        total_items,
+        &mut processed,
+        &mut summary,
+        &mut on_uploading,
+        &mut on_item,
+        &mut on_progress,
+    )?;
+
+    run_steam_manifest_only_pass(
+        cfg,
+        full,
+        and_purge_local,
+        only,
+        rsync_bin,
+        &shortcuts_names,
+        &excluded_steam,
+        &vault,
+        &full_install_remote,
+        &processed_steam_app_ids,
+        total_items,
+        &mut processed,
+        &mut summary,
+        &mut on_uploading,
+        &mut on_item,
+        &mut on_progress,
+    )?;
+
+    run_pirata_manifest_only_pass(
+        cfg,
+        full,
+        and_purge_local,
+        only,
+        rsync_bin,
+        &shortcuts_names,
+        &excluded_steam,
+        &vault,
+        &full_install_remote,
+        &processed_steam_app_ids,
+        total_items,
+        &mut processed,
+        &mut summary,
+        &mut on_uploading,
+        &mut on_item,
+        &mut on_progress,
+    )?;
+
+    run_epic_pass(
+        cfg,
+        full,
+        and_purge_local,
+        only,
+        rsync_bin,
+        ssh_bin,
+        &vault,
+        &full_install_remote,
+        legendary_installed_json.as_deref(),
+        total_items,
+        &mut processed,
+        &mut summary,
+        &mut on_uploading,
+        &mut on_item,
+        &mut on_progress,
+    )?;
+
+    Ok(summary)
+}
+
+/// Primeira passada: percorre `compatdata/<app_id>` em cada biblioteca
+/// local (Steam oficial e piratas juntos — a categoria só é decidida
+/// dentro do laço, por qual override/manifesto resolve). Devolve os
+/// app_ids já vistos aqui nesta execução, pra `run_steam_manifest_only_
+/// pass`/`run_pirata_manifest_only_pass` não reprocessarem (com
+/// `--and-purge-local`, este laço já pode ter apagado o compatdata e a
+/// instalação completa de um app_id antes das passadas seguintes lerem o
+/// disco de novo).
+#[allow(clippy::too_many_arguments)]
+fn run_steam_compatdata_pass(
+    cfg: &Config,
+    full: bool,
+    and_purge_local: bool,
+    only: Option<&str>,
+    rsync_bin: &str,
+    shortcuts_names: &std::collections::HashMap<u32, String>,
+    excluded_steam: &HashSet<String>,
+    vault: &RemoteVault,
+    full_install_remote: &Option<(&Path, HashSet<String>, HashSet<String>)>,
+    remote_entries: &HashSet<String>,
+    total_items: usize,
+    processed: &mut usize,
+    summary: &mut IngestSummary,
+    on_uploading: &mut dyn FnMut(&str),
+    on_item: &mut dyn FnMut(usize, usize, &str),
+    on_progress: &mut dyn FnMut(ProgressUpdate),
+) -> Result<HashSet<String>, IngestError> {
     let mut processed_steam_app_ids: HashSet<String> = HashSet::new();
 
     for local_lib in &cfg.local_libraries {
@@ -673,9 +778,9 @@ fn run_ingest_with_options(
                 continue;
             }
             processed_steam_app_ids.insert(app_id.clone());
-            let label = display_label(local_lib, &shortcuts_names, &app_id);
-            processed += 1;
-            on_item(processed, total_items, &label);
+            let label = display_label(local_lib, shortcuts_names, &app_id);
+            *processed += 1;
+            on_item(*processed, total_items, &label);
             summary.inspected += 1;
 
             // Incidente real (2026-09-06, Kenshi): antes, `compatdata_already_remote`
@@ -792,7 +897,7 @@ fn run_ingest_with_options(
                             known_names,
                             &install_dir,
                             &app_id,
-                            &mut on_progress,
+                            on_progress,
                         )?;
                         if category == "steam" {
                             upload_manifest_snapshot(
@@ -885,21 +990,43 @@ fn run_ingest_with_options(
         }
     }
 
-    // Segunda passada, só com `--full`: jogos oficiais instalados sem
-    // compatdata (nativos Linux) — o laço acima nunca os visita porque
-    // descobre tudo por `compatdata/`.
+    Ok(processed_steam_app_ids)
+}
+
+/// Segunda passada, só com `--full`: jogos oficiais instalados sem
+/// compatdata (nativos Linux) — o laço acima nunca os visita porque
+/// descobre tudo por `compatdata/`.
+#[allow(clippy::too_many_arguments)]
+fn run_steam_manifest_only_pass(
+    cfg: &Config,
+    full: bool,
+    and_purge_local: bool,
+    only: Option<&str>,
+    rsync_bin: &str,
+    shortcuts_names: &std::collections::HashMap<u32, String>,
+    excluded_steam: &HashSet<String>,
+    vault: &RemoteVault,
+    full_install_remote: &Option<(&Path, HashSet<String>, HashSet<String>)>,
+    processed_steam_app_ids: &HashSet<String>,
+    total_items: usize,
+    processed: &mut usize,
+    summary: &mut IngestSummary,
+    on_uploading: &mut dyn FnMut(&str),
+    on_item: &mut dyn FnMut(usize, usize, &str),
+    on_progress: &mut dyn FnMut(ProgressUpdate),
+) -> Result<(), IngestError> {
     if full {
         let (base, steam_names, _piratas_names) = full_install_remote
             .as_ref()
             .expect("full=true garante Some");
         for local_lib in &cfg.local_libraries {
-            for app_id in manifest_only_entries(local_lib, only, &excluded_steam) {
+            for app_id in manifest_only_entries(local_lib, only, excluded_steam) {
                 if processed_steam_app_ids.contains(&app_id) {
                     continue;
                 }
-                let label = display_label(local_lib, &shortcuts_names, &app_id);
-                processed += 1;
-                on_item(processed, total_items, &label);
+                let label = display_label(local_lib, shortcuts_names, &app_id);
+                *processed += 1;
+                on_item(*processed, total_items, &label);
                 summary.inspected += 1;
 
                 let steam_override = cfg.install_path_overrides.steam.get(&app_id);
@@ -940,7 +1067,7 @@ fn run_ingest_with_options(
                             steam_names,
                             &install_dir,
                             &app_id,
-                            &mut on_progress,
+                            on_progress,
                         )?;
                         upload_manifest_snapshot(
                             &vault.ssh_target,
@@ -1031,15 +1158,37 @@ fn run_ingest_with_options(
         }
     }
 
-    // Terceira passada, só com `--full`: jogos piratas com override
-    // configurado mas sem `compatdata` — nativo Linux, ou nunca lançado
-    // ainda. Deliberadamente NUNCA descoberto via `shortcuts.vdf`: o
-    // `StartDir` de um atalho non-Steam é só o que o usuário digitou uma
-    // vez ao criar o atalho, nunca atualizado depois — não é uma fonte
-    // confiável de "onde o jogo está" (diferente do manifesto Steam ou do
-    // `installed.json` do Legendary, mantidos pelas próprias plataformas).
-    // Só o override explícito do usuário é. Sem override, o jogo
-    // simplesmente não entra aqui — nem tentado, nem reportado.
+    Ok(())
+}
+
+/// Terceira passada, só com `--full`: jogos piratas com override
+/// configurado mas sem `compatdata` — nativo Linux, ou nunca lançado
+/// ainda. Deliberadamente NUNCA descoberto via `shortcuts.vdf`: o
+/// `StartDir` de um atalho non-Steam é só o que o usuário digitou uma
+/// vez ao criar o atalho, nunca atualizado depois — não é uma fonte
+/// confiável de "onde o jogo está" (diferente do manifesto Steam ou do
+/// `installed.json` do Legendary, mantidos pelas próprias plataformas).
+/// Só o override explícito do usuário é. Sem override, o jogo
+/// simplesmente não entra aqui — nem tentado, nem reportado.
+#[allow(clippy::too_many_arguments)]
+fn run_pirata_manifest_only_pass(
+    cfg: &Config,
+    full: bool,
+    and_purge_local: bool,
+    only: Option<&str>,
+    rsync_bin: &str,
+    shortcuts_names: &std::collections::HashMap<u32, String>,
+    excluded_steam: &HashSet<String>,
+    vault: &RemoteVault,
+    full_install_remote: &Option<(&Path, HashSet<String>, HashSet<String>)>,
+    processed_steam_app_ids: &HashSet<String>,
+    total_items: usize,
+    processed: &mut usize,
+    summary: &mut IngestSummary,
+    on_uploading: &mut dyn FnMut(&str),
+    on_item: &mut dyn FnMut(usize, usize, &str),
+    on_progress: &mut dyn FnMut(ProgressUpdate),
+) -> Result<(), IngestError> {
     if full {
         let (base, _steam_names, piratas_names) = full_install_remote
             .as_ref()
@@ -1048,7 +1197,7 @@ fn run_ingest_with_options(
             &cfg.local_libraries,
             &cfg.install_path_overrides.piratas,
             only,
-            &excluded_steam,
+            excluded_steam,
         ) {
             if processed_steam_app_ids.contains(&app_id) {
                 continue;
@@ -1059,8 +1208,8 @@ fn run_ingest_with_options(
                 .and_then(|numeric| shortcuts_names.get(&numeric))
                 .map(|name| format!("{app_id} — {name}"))
                 .unwrap_or_else(|| app_id.clone());
-            processed += 1;
-            on_item(processed, total_items, &label);
+            *processed += 1;
+            on_item(*processed, total_items, &label);
             summary.inspected += 1;
 
             let override_path = cfg.install_path_overrides.piratas.get(&app_id);
@@ -1084,7 +1233,7 @@ fn run_ingest_with_options(
                         piratas_names,
                         &install_dir,
                         &app_id,
-                        &mut on_progress,
+                        on_progress,
                     )?;
                     summary.full_uploaded += usize::from(!already_remote);
                     if and_purge_local && install_dir.exists() {
@@ -1117,6 +1266,32 @@ fn run_ingest_with_options(
         }
     }
 
+    Ok(())
+}
+
+/// Quarta e quinta passadas (agrupadas: vivem sob a mesma configuração
+/// `--heroic`): títulos Heroic com prefixo Wine (compatdata, mesmo
+/// princípio de `run_steam_compatdata_pass`) e, só com `--full`, títulos
+/// Epic sem prefixo (`installed.json` como fonte de descoberta completa,
+/// mesmo princípio das passadas "manifest-only" de Steam/piratas).
+#[allow(clippy::too_many_arguments)]
+fn run_epic_pass(
+    cfg: &Config,
+    full: bool,
+    and_purge_local: bool,
+    only: Option<&str>,
+    rsync_bin: &str,
+    ssh_bin: &str,
+    vault: &RemoteVault,
+    full_install_remote: &Option<(&Path, HashSet<String>, HashSet<String>)>,
+    legendary_installed_json: Option<&Path>,
+    total_items: usize,
+    processed: &mut usize,
+    summary: &mut IngestSummary,
+    on_uploading: &mut dyn FnMut(&str),
+    on_item: &mut dyn FnMut(usize, usize, &str),
+    on_progress: &mut dyn FnMut(ProgressUpdate),
+) -> Result<(), IngestError> {
     if let (Some(heroic_local_root), Some(heroic_remote_base_path)) =
         (&cfg.heroic_local_root, &cfg.heroic_remote_base_path)
     {
@@ -1166,7 +1341,7 @@ fn run_ingest_with_options(
         // `full_skipped` pra qualquer título Heroic com prefixo existente.
         let mut processed_heroic_titles: HashSet<String> = HashSet::new();
         let Ok(entries) = std::fs::read_dir(heroic_local_root) else {
-            return Ok(summary);
+            return Ok(());
         };
         for entry in entries.flatten() {
             if !entry.path().is_dir() {
@@ -1177,8 +1352,8 @@ fn run_ingest_with_options(
                 continue;
             }
             processed_heroic_titles.insert(title.clone());
-            processed += 1;
-            on_item(processed, total_items, &title);
+            *processed += 1;
+            on_item(*processed, total_items, &title);
             summary.inspected += 1;
 
             // Mesmo fix do ramo Steam acima (ver comentário lá): nunca pular
@@ -1215,7 +1390,7 @@ fn run_ingest_with_options(
                 true
             } else {
                 let epic_override = cfg.install_path_overrides.epic.get(&title);
-                let resolved = legendary_installed_json.as_deref().and_then(|json| {
+                let resolved = legendary_installed_json.and_then(|json| {
                     install_paths::resolve_legendary_install_path(
                         json,
                         &title,
@@ -1242,7 +1417,7 @@ fn run_ingest_with_options(
                             epic_names,
                             &install_dir,
                             &title,
-                            &mut on_progress,
+                            on_progress,
                         )?;
                         summary.full_uploaded += usize::from(!already_remote);
                         local_install_dir_for_purge = Some(synced);
@@ -1259,10 +1434,9 @@ fn run_ingest_with_options(
                         let override_name = epic_override
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().into_owned());
-                        let installed_json_name =
-                            legendary_installed_json.as_deref().and_then(|json| {
-                                install_paths::legendary_installdir_name(json, &title)
-                            });
+                        let installed_json_name = legendary_installed_json.and_then(|json| {
+                            install_paths::legendary_installdir_name(json, &title)
+                        });
                         let already_migrated = override_name
                             .as_deref()
                             .is_some_and(|n| epic_names.contains(n))
@@ -1302,7 +1476,7 @@ fn run_ingest_with_options(
                     // jogo como "Cliente"/"Cliente+Servidor" pra sempre,
                     // mesmo 100% migrado. Mesmo princípio de Steam apagar o
                     // `appmanifest` no purge.
-                    if let Some(json) = legendary_installed_json.as_deref() {
+                    if let Some(json) = legendary_installed_json {
                         install_paths::remove_legendary_installed_entry(json, &title).map_err(
                             |source| IngestError::StaleMetadataCleanup {
                                 title: title.clone(),
@@ -1320,14 +1494,14 @@ fn run_ingest_with_options(
         // nunca lançados. `installed.json` é a fonte de descoberta
         // completa; o prefixo, aqui, é opcional.
         if full {
-            if let Some(json) = legendary_installed_json.as_deref() {
+            if let Some(json) = legendary_installed_json {
                 let (base, epic_names) = epic_remote.as_ref().expect("full=true garante Some");
                 for title in epic_manifest_only_entries(heroic_local_root, json, only) {
                     if processed_heroic_titles.contains(&title) {
                         continue;
                     }
-                    processed += 1;
-                    on_item(processed, total_items, &title);
+                    *processed += 1;
+                    on_item(*processed, total_items, &title);
                     summary.inspected += 1;
 
                     let epic_override = cfg.install_path_overrides.epic.get(&title);
@@ -1354,7 +1528,7 @@ fn run_ingest_with_options(
                                 epic_names,
                                 &install_dir,
                                 &title,
-                                &mut on_progress,
+                                on_progress,
                             )?;
                             summary.full_uploaded += usize::from(!already_remote);
                             if and_purge_local && install_dir.exists() {
@@ -1419,7 +1593,7 @@ fn run_ingest_with_options(
         }
     }
 
-    Ok(summary)
+    Ok(())
 }
 
 #[cfg(test)]
