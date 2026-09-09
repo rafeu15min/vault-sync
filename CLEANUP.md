@@ -7,10 +7,12 @@
 > ligada a incidente real documentado.
 >
 > **Status (2026-09-08)**: git inicializado (commit `15f99cf`, baseline
-> pré-limpeza). **Camadas 1, 2 e 3 executadas e commitadas** (`81cf920`,
-> `a08027f`..`b58c4eb`, `6066d5b`). Camada 4 dissecada em 3 sub-fases
-> (ver seção própria abaixo) — **4.1 e 4.2 feitas** (`b2b5724`,
-> `cf3635b`), 4.3 não decidida. Achado ao longo da Camada 2, não
+> pré-limpeza). **Todas as Camadas concluídas** — 1, 2, 3 (`81cf920`,
+> `a08027f`..`b58c4eb`, `6066d5b`) e 4 nas 3 sub-fases dissecadas (ver
+> seção própria abaixo): 4.1 (`b2b5724`), 4.2 (`cf3635b`), 4.3
+> (`a9ef2a4` — decidida como as extrações mecânicas que sobravam, não a
+> fusão completa numa passada genérica, avaliada e descartada por risco).
+> **Plano de polimento da V1 encerrado.** Achado ao longo da Camada 2, não
 > relacionado a ela: `cargo test` sem `--test-threads=1` é
 > intermitentemente flaky (ETXTBSY em scripts fake recém-escritos) —
 > confirmado preexistente já no baseline da Camada 1, não introduzido nem
@@ -192,11 +194,19 @@ suíte de regressão):
 >   si, o que fazer depois do sync (rastrear pra purgar depois vs. purgar
 >   na hora) e a checagem de metadado obsoleto no `None` continuam
 >   por passada — variação real por categoria, não duplicação mecânica.
-> - **4.3 (não decidida, opcional)**: fusão completa numa passada
->   genérica parametrizada — onde os testes pareados
->   (`full_manifest_only_entry_...` / `full_pirata_manifest_only_entry_
->   ...`) colapsariam juntos. Maior risco, avaliar só se 4.2 ainda deixar
->   isso parecendo valer a pena.
+> - **4.3 (feita, commit `a9ef2a4` — escopo revisado)**: comparei as 5
+>   passadas em detalhe pra avaliar a fusão completa numa passada
+>   genérica parametrizada. Concluí que NÃO vale o risco: as diferenças
+>   reais por categoria (descoberta, resolução, guarda opcional de
+>   compat-tool, hook de purga extra pro Legendary, checagem de metadado
+>   obsoleto com formas distintas) exigiriam tantos parâmetros/closures
+>   que a função unificada ficaria mais difícil de ler que as 4 funções
+>   atuais — não colapsei os testes pareados, ficam como estão. Em vez
+>   disso, extraí o que sobrava de genuinamente mecânico no núcleo:
+>   `already_migrated(candidates)` (checar nomes candidatos contra o que
+>   já está confirmado no FeuVault, repetido nas 5 passadas) e
+>   `purge_full_install_dir`/`purge_old_manifest` (apagar um caminho se
+>   existir, com erro padronizado, repetido 3x e 2x).
 
 - **`ingest.rs:918-1145` (+ passada Epic mais adiante no arquivo)** — três
   passadas quase idênticas (Steam oficial, piratas, Epic) repetindo
@@ -270,3 +280,16 @@ que a auditoria encontrou: a cultura de "um teste de regressão por
 incidente real" deste projeto foi disciplinada desde o início, então a
 maior parte do que parecia "gordura" à primeira vista era na verdade
 proteção justificada.
+
+## Encerramento (2026-09-08)
+
+Todas as 4 camadas concluídas. A Camada 4 acabou não reduzindo linhas
+(a extração de funções nomeadas + helpers do núcleo compartilhado
+adiciona um pouco mais do que remove, de propósito — o ganho ali é
+navegabilidade e cobertura de teste, não contagem de linhas), mas
+`run_ingest_with_options` saiu de uma função só de ~870 linhas pra um
+orquestrador de ~80 linhas + 4 passadas nomeadas + 3 helpers
+compartilhados testáveis. A fusão completa numa passada genérica
+(4.3 original) foi avaliada e descartada por risco — ver nota na seção
+da Camada 4. `git log` no repositório carrega o histórico completo,
+commit por commit, de cada decisão tomada ao longo do processo.
