@@ -9,8 +9,8 @@
 > **Status (2026-09-08)**: git inicializado (commit `15f99cf`, baseline
 > pré-limpeza). **Camadas 1, 2 e 3 executadas e commitadas** (`81cf920`,
 > `a08027f`..`b58c4eb`, `6066d5b`). Camada 4 dissecada em 3 sub-fases
-> (ver seção própria abaixo) — **4.1 feita** (`b2b5724`), 4.2/4.3 não
-> decididas. Achado ao longo da Camada 2, não
+> (ver seção própria abaixo) — **4.1 e 4.2 feitas** (`b2b5724`,
+> `cf3635b`), 4.3 não decidida. Achado ao longo da Camada 2, não
 > relacionado a ela: `cargo test` sem `--test-threads=1` é
 > intermitentemente flaky (ETXTBSY em scripts fake recém-escritos) —
 > confirmado preexistente já no baseline da Camada 1, não introduzido nem
@@ -184,11 +184,14 @@ suíte de regressão):
 >   as duas do lado Heroic/Epic), zero mudança de comportamento, núcleo
 >   duplicado deixado como estava. `run_ingest_with_options` caiu de
 >   ~870 pra ~80 linhas.
-> - **4.2 (não decidida)**: extrair só o núcleo "resolver → pular se
+> - **4.2 (feita, commit `cf3635b`)**: do núcleo "resolver → pular se
 >   compat tool → checar `already_remote` → `sync_full_install` →
->   apagar → checar metadado obsoleto" pras 5 passadas chamarem, sem
->   fundir os laços de descoberta externos (compatdata continua
->   diferente de manifest-only).
+>   apagar → checar metadado obsoleto", só a fatia mecanicamente idêntica
+>   nas 5 passadas (`already_remote` + `sync_full_install` +
+>   `full_uploaded`) virou `sync_full_install_and_report`. A resolução em
+>   si, o que fazer depois do sync (rastrear pra purgar depois vs. purgar
+>   na hora) e a checagem de metadado obsoleto no `None` continuam
+>   por passada — variação real por categoria, não duplicação mecânica.
 > - **4.3 (não decidida, opcional)**: fusão completa numa passada
 >   genérica parametrizada — onde os testes pareados
 >   (`full_manifest_only_entry_...` / `full_pirata_manifest_only_entry_
