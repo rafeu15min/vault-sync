@@ -230,6 +230,56 @@ fn sync_full_install_and_report(
     Ok(synced)
 }
 
+/// Um jogo cuja instalação completa não resolveu no disco (pasta ausente)
+/// pode já estar migrada com sucesso — manifesto/override/`installed.json`
+/// ficam obsoletos sozinhos (histórico documentado em cada passada de
+/// `run_ingest_with_options`) depois de um `--and-purge-local` anterior;
+/// pasta ausente não é o mesmo que "nunca instalado". Compara cada nome
+/// candidato (de fontes diferentes por categoria — cada par nome/conjunto
+/// é independente, por isso não é um único `known_names` compartilhado)
+/// contra o que já está confirmado no FeuVault. `None` num candidato
+/// (fonte não disponível, ex.: sem manifesto local) simplesmente não
+/// contribui, sem precisar de um caso especial pra isso.
+fn already_migrated(candidates: &[(Option<&str>, &HashSet<String>)]) -> bool {
+    candidates
+        .iter()
+        .any(|(name, known_names)| name.is_some_and(|n| known_names.contains(n)))
+}
+
+/// Remove `install_dir` do disco se ele existir de verdade — devolve se
+/// removeu algo (`false` quando já não havia nada ali, ex.: purgado numa
+/// execução anterior). Usado depois de uma instalação completa já
+/// sincronizada, quando `--and-purge-local` está ativo. `id_for_error` só
+/// identifica a falha no `IngestError::Cleanup` devolvido, nunca decide o
+/// que apagar.
+fn purge_full_install_dir(install_dir: &Path, id_for_error: &str) -> Result<bool, IngestError> {
+    if !install_dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(install_dir).map_err(|source| IngestError::Cleanup {
+        app_id: id_for_error.to_string(),
+        source,
+    })?;
+    Ok(true)
+}
+
+/// Remove um único arquivo de manifesto se ele ainda existir — reaproveitado
+/// tanto pro `appmanifest_<id>.acf` obsoleto (sem instalação nem compatdata
+/// local pra ele) quanto pro manifesto antigo que sobra em `local_lib`
+/// depois de `adopt_official_manifest` copiar pra `local_game_root_steam`
+/// (`old_manifest_to_purge`). Mesmo princípio de `purge_full_install_dir`,
+/// sem o valor de retorno booleano porque nenhuma passada precisa
+/// condicionar mais nada a isso.
+fn purge_old_manifest(old_manifest: &Path, id_for_error: &str) -> Result<(), IngestError> {
+    if old_manifest.exists() {
+        std::fs::remove_file(old_manifest).map_err(|source| IngestError::Cleanup {
+            app_id: id_for_error.to_string(),
+            source,
+        })?;
+    }
+    Ok(())
+}
+
 /// Copia `appmanifest_<app_id>.acf` de `local_lib` pro FeuVault, num
 /// namespace próprio (`<remote_installs_base_path>/steam-manifests/<app_id>.acf`,
 /// separado da árvore `steam/<nome>` — o nome da pasta só é conhecido
@@ -981,12 +1031,10 @@ fn run_steam_compatdata_pass(
                         let piratas_override_name = piratas_override
                             .and_then(|p| p.file_name())
                             .map(|n| n.to_string_lossy().into_owned());
-                        let already_migrated = steam_name
-                            .as_deref()
-                            .is_some_and(|n| steam_names.contains(n))
-                            || piratas_override_name
-                                .as_deref()
-                                .is_some_and(|n| piratas_names.contains(n));
+                        let already_migrated = already_migrated(&[
+                            (steam_name.as_deref(), steam_names),
+                            (piratas_override_name.as_deref(), piratas_names),
+                        ]);
                         if !already_migrated {
                             summary.full_skipped.push(label.clone());
                         }
@@ -1006,24 +1054,10 @@ fn run_steam_compatdata_pass(
                     source,
                 })?;
                 if let Some(install_dir) = &local_install_dir_for_purge {
-                    if install_dir.exists() {
-                        std::fs::remove_dir_all(install_dir).map_err(|source| {
-                            IngestError::Cleanup {
-                                app_id: app_id.clone(),
-                                source,
-                            }
-                        })?;
-                    }
+                    purge_full_install_dir(install_dir, &app_id)?;
                 }
                 if let Some(old_manifest) = &old_manifest_to_purge {
-                    if old_manifest.exists() {
-                        std::fs::remove_file(old_manifest).map_err(|source| {
-                            IngestError::Cleanup {
-                                app_id: app_id.clone(),
-                                source,
-                            }
-                        })?;
-                    }
+                    purge_old_manifest(old_manifest, &app_id)?;
                 }
                 summary.purged_local += 1;
             }
@@ -1126,9 +1160,9 @@ fn run_steam_manifest_only_pass(
                         // checagem, todo `ingest --full` seguinte reportava
                         // de novo (falsamente) qualquer jogo já migrado com
                         // sucesso em execuções anteriores.
+                        let steam_name = install_paths::manifest_installdir(local_lib, &app_id);
                         let already_migrated =
-                            install_paths::manifest_installdir(local_lib, &app_id)
-                                .is_some_and(|installdir| steam_names.contains(&installdir));
+                            already_migrated(&[(steam_name.as_deref(), steam_names)]);
                         if !already_migrated {
                             summary.full_skipped.push(label.clone());
                         } else if and_purge_local {
@@ -1159,33 +1193,14 @@ fn run_steam_manifest_only_pass(
 
                 if and_purge_local && full_install_ok {
                     if let Some(install_dir) = &local_install_dir_for_purge {
-                        if install_dir.exists() {
-                            std::fs::remove_dir_all(install_dir).map_err(|source| {
-                                IngestError::Cleanup {
-                                    app_id: app_id.clone(),
-                                    source,
-                                }
-                            })?;
-                        }
+                        purge_full_install_dir(install_dir, &app_id)?;
                     }
                     let manifest = local_lib
                         .join("steamapps")
                         .join(format!("appmanifest_{app_id}.acf"));
-                    if manifest.exists() {
-                        std::fs::remove_file(&manifest).map_err(|source| IngestError::Cleanup {
-                            app_id: app_id.clone(),
-                            source,
-                        })?;
-                    }
+                    purge_old_manifest(&manifest, &app_id)?;
                     if let Some(old_manifest) = &old_manifest_to_purge {
-                        if old_manifest.exists() {
-                            std::fs::remove_file(old_manifest).map_err(|source| {
-                                IngestError::Cleanup {
-                                    app_id: app_id.clone(),
-                                    source,
-                                }
-                            })?;
-                        }
+                        purge_old_manifest(old_manifest, &app_id)?;
                     }
                     summary.purged_local += 1;
                 }
@@ -1283,11 +1298,11 @@ fn run_pirata_manifest_only_pass(
                     // migrada e apagada por este mesmo `--and-purge-local`
                     // numa execução anterior. Checa o nome contra o que já
                     // está remoto antes de desistir.
-                    let already_migrated = override_path
+                    let override_name = override_path
                         .and_then(|p| p.file_name())
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .as_deref()
-                        .is_some_and(|n| piratas_names.contains(n));
+                        .map(|n| n.to_string_lossy().into_owned());
+                    let already_migrated =
+                        already_migrated(&[(override_name.as_deref(), piratas_names)]);
                     if !already_migrated {
                         summary.full_skipped.push(label.clone());
                     }
@@ -1462,12 +1477,10 @@ fn run_epic_pass(
                         let installed_json_name = legendary_installed_json.and_then(|json| {
                             install_paths::legendary_installdir_name(json, &title)
                         });
-                        let already_migrated = override_name
-                            .as_deref()
-                            .is_some_and(|n| epic_names.contains(n))
-                            || installed_json_name
-                                .as_deref()
-                                .is_some_and(|n| epic_names.contains(n));
+                        let already_migrated = already_migrated(&[
+                            (override_name.as_deref(), epic_names),
+                            (installed_json_name.as_deref(), epic_names),
+                        ]);
                         if !already_migrated {
                             summary.full_skipped.push(title.clone());
                         }
@@ -1486,14 +1499,7 @@ fn run_epic_pass(
                     source,
                 })?;
                 if let Some(install_dir) = &local_install_dir_for_purge {
-                    if install_dir.exists() {
-                        std::fs::remove_dir_all(install_dir).map_err(|source| {
-                            IngestError::Cleanup {
-                                app_id: title.clone(),
-                                source,
-                            }
-                        })?;
-                    }
+                    purge_full_install_dir(install_dir, &title)?;
                     // Sem isto, o `installed.json` continua afirmando que
                     // `title` está instalado na pasta que acabamos de
                     // apagar — o catálogo (`local_heroic_titles`,
@@ -1580,12 +1586,10 @@ fn run_epic_pass(
                                 .map(|n| n.to_string_lossy().into_owned());
                             let installed_json_name =
                                 install_paths::legendary_installdir_name(json, &title);
-                            let already_migrated = override_name
-                                .as_deref()
-                                .is_some_and(|n| epic_names.contains(n))
-                                || installed_json_name
-                                    .as_deref()
-                                    .is_some_and(|n| epic_names.contains(n));
+                            let already_migrated = already_migrated(&[
+                                (override_name.as_deref(), epic_names),
+                                (installed_json_name.as_deref(), epic_names),
+                            ]);
                             if !already_migrated {
                                 summary.full_skipped.push(title.clone());
                             } else if and_purge_local {
