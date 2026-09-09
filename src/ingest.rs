@@ -185,6 +185,51 @@ fn sync_full_install(
     Ok(local_install_dir.to_path_buf())
 }
 
+/// Decide "já remoto ou upload novo" (compara o nome de `install_dir`
+/// contra `known_names`, o retrato já consultado antes de qualquer laço
+/// começar) e chama [`sync_full_install`], contabilizando o resultado em
+/// `summary.full_uploaded`. Núcleo repetido nas 5 passadas de
+/// `run_ingest_with_options` (CLEANUP.md, Camada 4.2) sempre que uma
+/// instalação completa acaba de ser resolvida — só a categoria, o
+/// conjunto de nomes conhecidos e o rótulo mudam entre elas; a resolução
+/// em si (de onde vem `install_dir`) e o que fazer depois (rastrear pra
+/// purga mais tarde vs. apagar na hora) continuam em cada passada, por
+/// serem genuinamente diferentes por categoria.
+#[allow(clippy::too_many_arguments)]
+fn sync_full_install_and_report(
+    ssh_target: &str,
+    rsync_bin: &str,
+    category: &str,
+    remote_installs_base_path: &Path,
+    known_names: &HashSet<String>,
+    install_dir: &Path,
+    id_or_title: &str,
+    label: &str,
+    summary: &mut IngestSummary,
+    on_uploading: &mut dyn FnMut(&str),
+    on_progress: &mut dyn FnMut(ProgressUpdate),
+) -> Result<PathBuf, IngestError> {
+    let already_remote = install_dir
+        .file_name()
+        .map(|n| known_names.contains(n.to_string_lossy().as_ref()))
+        .unwrap_or(false);
+    if !already_remote {
+        on_uploading(&format!("{label} (instalação completa)"));
+    }
+    let synced = sync_full_install(
+        ssh_target,
+        rsync_bin,
+        category,
+        remote_installs_base_path,
+        known_names,
+        install_dir,
+        id_or_title,
+        on_progress,
+    )?;
+    summary.full_uploaded += usize::from(!already_remote);
+    Ok(synced)
+}
+
 /// Copia `appmanifest_<app_id>.acf` de `local_lib` pro FeuVault, num
 /// namespace próprio (`<remote_installs_base_path>/steam-manifests/<app_id>.acf`,
 /// separado da árvore `steam/<nome>` — o nome da pasta só é conhecido
@@ -882,14 +927,7 @@ fn run_steam_compatdata_pass(
                         } else {
                             piratas_names
                         };
-                        let already_remote = install_dir
-                            .file_name()
-                            .map(|n| known_names.contains(n.to_string_lossy().as_ref()))
-                            .unwrap_or(false);
-                        if !already_remote {
-                            on_uploading(&format!("{label} (instalação completa)"));
-                        }
-                        let synced = sync_full_install(
+                        let synced = sync_full_install_and_report(
                             &vault.ssh_target,
                             rsync_bin,
                             category,
@@ -897,6 +935,9 @@ fn run_steam_compatdata_pass(
                             known_names,
                             &install_dir,
                             &app_id,
+                            &label,
+                            summary,
+                            on_uploading,
                             on_progress,
                         )?;
                         if category == "steam" {
@@ -908,7 +949,6 @@ fn run_steam_compatdata_pass(
                                 &app_id,
                             );
                         }
-                        summary.full_uploaded += usize::from(!already_remote);
                         local_install_dir_for_purge = Some(synced);
                         true
                     }
@@ -1052,14 +1092,7 @@ fn run_steam_manifest_only_pass(
                             summary.official_manifests_migrated += usize::from(migrated_now);
                             old_manifest_to_purge = old_manifest;
                         }
-                        let already_remote = install_dir
-                            .file_name()
-                            .map(|n| steam_names.contains(n.to_string_lossy().as_ref()))
-                            .unwrap_or(false);
-                        if !already_remote {
-                            on_uploading(&format!("{label} (instalação completa)"));
-                        }
-                        let synced = sync_full_install(
+                        let synced = sync_full_install_and_report(
                             &vault.ssh_target,
                             rsync_bin,
                             "steam",
@@ -1067,6 +1100,9 @@ fn run_steam_manifest_only_pass(
                             steam_names,
                             &install_dir,
                             &app_id,
+                            &label,
+                            summary,
+                            on_uploading,
                             on_progress,
                         )?;
                         upload_manifest_snapshot(
@@ -1076,7 +1112,6 @@ fn run_steam_manifest_only_pass(
                             local_lib,
                             &app_id,
                         );
-                        summary.full_uploaded += usize::from(!already_remote);
                         local_install_dir_for_purge = Some(synced);
                         true
                     }
@@ -1218,14 +1253,7 @@ fn run_pirata_manifest_only_pass(
             match resolved {
                 Some(install_dir) if is_compat_tool_install(&install_dir) => {}
                 Some(install_dir) => {
-                    let already_remote = install_dir
-                        .file_name()
-                        .map(|n| piratas_names.contains(n.to_string_lossy().as_ref()))
-                        .unwrap_or(false);
-                    if !already_remote {
-                        on_uploading(&format!("{label} (instalação completa)"));
-                    }
-                    sync_full_install(
+                    sync_full_install_and_report(
                         &vault.ssh_target,
                         rsync_bin,
                         "piratas",
@@ -1233,9 +1261,11 @@ fn run_pirata_manifest_only_pass(
                         piratas_names,
                         &install_dir,
                         &app_id,
+                        &label,
+                        summary,
+                        on_uploading,
                         on_progress,
                     )?;
-                    summary.full_uploaded += usize::from(!already_remote);
                     if and_purge_local && install_dir.exists() {
                         std::fs::remove_dir_all(&install_dir).map_err(|source| {
                             IngestError::Cleanup {
@@ -1402,14 +1432,7 @@ fn run_epic_pass(
                     Some(install_dir) => {
                         let (base, epic_names) =
                             epic_remote.as_ref().expect("full=true garante Some");
-                        let already_remote = install_dir
-                            .file_name()
-                            .map(|n| epic_names.contains(n.to_string_lossy().as_ref()))
-                            .unwrap_or(false);
-                        if !already_remote {
-                            on_uploading(&format!("{title} (instalação completa)"));
-                        }
-                        let synced = sync_full_install(
+                        let synced = sync_full_install_and_report(
                             &vault.ssh_target,
                             rsync_bin,
                             "epic",
@@ -1417,9 +1440,11 @@ fn run_epic_pass(
                             epic_names,
                             &install_dir,
                             &title,
+                            &title,
+                            summary,
+                            on_uploading,
                             on_progress,
                         )?;
-                        summary.full_uploaded += usize::from(!already_remote);
                         local_install_dir_for_purge = Some(synced);
                         true
                     }
@@ -1513,14 +1538,7 @@ fn run_epic_pass(
 
                     match resolved {
                         Some(install_dir) => {
-                            let already_remote = install_dir
-                                .file_name()
-                                .map(|n| epic_names.contains(n.to_string_lossy().as_ref()))
-                                .unwrap_or(false);
-                            if !already_remote {
-                                on_uploading(&format!("{title} (instalação completa)"));
-                            }
-                            sync_full_install(
+                            sync_full_install_and_report(
                                 &vault.ssh_target,
                                 rsync_bin,
                                 "epic",
@@ -1528,9 +1546,11 @@ fn run_epic_pass(
                                 epic_names,
                                 &install_dir,
                                 &title,
+                                &title,
+                                summary,
+                                on_uploading,
                                 on_progress,
                             )?;
-                            summary.full_uploaded += usize::from(!already_remote);
                             if and_purge_local && install_dir.exists() {
                                 std::fs::remove_dir_all(&install_dir).map_err(|source| {
                                     IngestError::Cleanup {
