@@ -66,6 +66,29 @@ pub struct DoctorReport {
     /// remoção é sempre um passo separado e explícito, nunca automático
     /// aqui.
     pub stale_shortcuts: Vec<StaleShortcut>,
+    /// App_ids com override de pirata configurado (`install_path_overrides.
+    /// piratas`) mas sem nenhum campo `Exe` correspondente em nenhum
+    /// `shortcuts.vdf` local — normalmente porque o arquivo inteiro sumiu
+    /// ou foi resetado pela própria Steam (incidente real, 2026-09-09:
+    /// Phonopolis parou de lançar assim, `menu-launch` falhava sem
+    /// nenhuma pista visível). Nunca uma falha dura — só um aviso; `doctor`
+    /// nunca escreve em `shortcuts.vdf`.
+    pub missing_pirata_shortcuts: Vec<MissingPirataShortcut>,
+    /// `true` quando existe pelo menos um backup automático do vault-sync
+    /// (`shortcuts.vdf.vault-sync-bak*`, criado por `atomic_backup` antes
+    /// de qualquer escrita) em algum perfil local — só relevante (e só
+    /// computado) quando `missing_pirata_shortcuts` não está vazio, pra
+    /// dizer ao usuário que uma recuperação sem digitar tudo de novo é
+    /// possível.
+    pub shortcuts_vdf_backup_available: bool,
+}
+
+/// Um pirata rastreado em `config.json` que `doctor` não conseguiu achar
+/// no `shortcuts.vdf` ao vivo desta máquina.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingPirataShortcut {
+    pub app_id: String,
+    pub override_path: PathBuf,
 }
 
 impl DoctorReport {
@@ -110,6 +133,44 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
     run_doctor_with_options(cfg, "ssh", scan::find_steam_root().as_deref())
 }
 
+fn missing_pirata_shortcuts(cfg: &Config, steam_root: &Path) -> Vec<MissingPirataShortcut> {
+    cfg.install_path_overrides
+        .piratas
+        .iter()
+        .filter_map(|(app_id, override_path)| {
+            let numeric = app_id.parse::<u32>().ok()?;
+            if scan::find_shortcut_exe(steam_root, numeric).is_some() {
+                return None;
+            }
+            Some(MissingPirataShortcut {
+                app_id: app_id.clone(),
+                override_path: override_path.clone(),
+            })
+        })
+        .collect()
+}
+
+/// `shortcuts.vdf.vault-sync-bak*` em qualquer perfil local — os mesmos
+/// backups que `backup::atomic_backup` já grava sozinho antes de qualquer
+/// escrita em `shortcuts.vdf` (ver `inject.rs`/`purge.rs`), aqui só
+/// checados pra existência, nunca lidos ou restaurados por `doctor`.
+fn any_shortcuts_vdf_backup_exists(steam_root: &Path) -> bool {
+    let Ok(profiles) = std::fs::read_dir(steam_root.join("userdata")) else {
+        return false;
+    };
+    profiles.flatten().any(|profile| {
+        let Ok(config_entries) = std::fs::read_dir(profile.path().join("config")) else {
+            return false;
+        };
+        config_entries.flatten().any(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("shortcuts.vdf.vault-sync-bak")
+        })
+    })
+}
+
 fn run_doctor_with_options(cfg: &Config, ssh_bin: &str, steam_root: Option<&Path>) -> DoctorReport {
     let libraries = cfg
         .local_libraries
@@ -142,6 +203,12 @@ fn run_doctor_with_options(cfg: &Config, ssh_bin: &str, steam_root: Option<&Path
         .map(scan::find_stale_shortcuts)
         .unwrap_or_default();
 
+    let missing_pirata_shortcuts = steam_root
+        .map(|root| missing_pirata_shortcuts(cfg, root))
+        .unwrap_or_default();
+    let shortcuts_vdf_backup_available = !missing_pirata_shortcuts.is_empty()
+        && steam_root.is_some_and(any_shortcuts_vdf_backup_exists);
+
     DoctorReport {
         libraries,
         remote: RemoteCheck {
@@ -152,6 +219,8 @@ fn run_doctor_with_options(cfg: &Config, ssh_bin: &str, steam_root: Option<&Path
         },
         heroic,
         stale_shortcuts,
+        missing_pirata_shortcuts,
+        shortcuts_vdf_backup_available,
     }
 }
 
@@ -465,5 +534,71 @@ mod tests {
             !report.has_hard_failures(),
             "atalho obsoleto nunca deve ser tratado como falha dura"
         );
+    }
+
+    #[test]
+    fn missing_pirata_shortcuts_flags_overrides_without_a_live_exe_entry() {
+        // Regressão do incidente real (2026-09-09, Phonopolis): o
+        // shortcuts.vdf da conta principal sumiu por completo, e
+        // `menu-launch` falhava sem nenhuma pista visível de por quê.
+        let dir = test_dir("missing-pirata-shortcuts");
+        let steam_root = dir.join("steam");
+        let userdata = steam_root.join("userdata").join("1").join("config");
+        fs::create_dir_all(&userdata).unwrap();
+        fs::write(
+            userdata.join("shortcuts.vdf"),
+            crate::vdf::write_binary(&vec![(
+                "shortcuts".to_string(),
+                crate::vdf::VdfValue::Object(vec![(
+                    "0".to_string(),
+                    crate::vdf::VdfValue::Object(vec![
+                        ("appid".to_string(), crate::vdf::VdfValue::Int(111)),
+                        (
+                            "appname".to_string(),
+                            crate::vdf::VdfValue::Str("Presente".to_string()),
+                        ),
+                        (
+                            "Exe".to_string(),
+                            crate::vdf::VdfValue::Str("\"/jogos/presente.exe\"".to_string()),
+                        ),
+                    ]),
+                )]),
+            )]),
+        )
+        .unwrap();
+
+        let mut cfg = cfg_with_libs(vec![dir.join("ssd")]);
+        cfg.install_path_overrides
+            .piratas
+            .insert("111".to_string(), PathBuf::from("/jogos/presente"));
+        cfg.install_path_overrides
+            .piratas
+            .insert("222".to_string(), PathBuf::from("/jogos/ausente"));
+
+        let missing = missing_pirata_shortcuts(&cfg, &steam_root);
+
+        assert_eq!(missing.len(), 1, "só o 222 deveria faltar: {missing:?}");
+        assert_eq!(missing[0].app_id, "222");
+    }
+
+    #[test]
+    fn any_shortcuts_vdf_backup_exists_detects_a_backup_in_any_profile() {
+        let dir = test_dir("shortcuts-backup-present");
+        let steam_root = dir.join("steam");
+        let config_dir = steam_root.join("userdata").join("1").join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        fs::write(config_dir.join("shortcuts.vdf.vault-sync-bak-12345"), b"").unwrap();
+
+        assert!(any_shortcuts_vdf_backup_exists(&steam_root));
+    }
+
+    #[test]
+    fn any_shortcuts_vdf_backup_exists_is_false_without_any_backup() {
+        let dir = test_dir("shortcuts-backup-absent");
+        let steam_root = dir.join("steam");
+        let config_dir = steam_root.join("userdata").join("1").join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+
+        assert!(!any_shortcuts_vdf_backup_exists(&steam_root));
     }
 }

@@ -862,6 +862,29 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Informativo, nunca uma falha dura — mesmo princípio de
+            // `stale_shortcuts` acima. `doctor` nunca escreve em
+            // `shortcuts.vdf`; restaurar de um backup é sempre manual.
+            if !report.missing_pirata_shortcuts.is_empty() {
+                println!(
+                    "[vault-sync] doctor — piratas sem atalho non-Steam correspondente ({}):",
+                    report.missing_pirata_shortcuts.len()
+                );
+                for missing in &report.missing_pirata_shortcuts {
+                    println!(
+                        "  AppID {} ({}) — sem campo Exe em nenhum shortcuts.vdf local",
+                        missing.app_id,
+                        missing.override_path.display()
+                    );
+                }
+                if report.shortcuts_vdf_backup_available {
+                    println!(
+                        "  Encontrado um backup automático (shortcuts.vdf.vault-sync-bak*) — \
+                         pode ser o que sumiu; confira antes de recriar os atalhos na mão."
+                    );
+                }
+            }
+
             let libraries_ok = report.libraries.iter().filter(|l| l.exists).count();
             let mut summary_text = format!(
                 "Bibliotecas locais: {}/{} OK\n{}: {}\n{}",
@@ -883,6 +906,17 @@ fn main() -> anyhow::Result<()> {
                 summary_text.push_str(&format!(
                     "\n{} atalho(s) Steam obsoleto(s) — resíduo de remanejo de disco",
                     report.stale_shortcuts.len()
+                ));
+            }
+            if !report.missing_pirata_shortcuts.is_empty() {
+                summary_text.push_str(&format!(
+                    "\n{} pirata(s) sem atalho non-Steam correspondente{}",
+                    report.missing_pirata_shortcuts.len(),
+                    if report.shortcuts_vdf_backup_available {
+                        " (há um backup automático a conferir)"
+                    } else {
+                        ""
+                    }
                 ));
             }
 
