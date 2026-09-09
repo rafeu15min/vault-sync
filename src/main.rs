@@ -29,6 +29,7 @@ mod remote;
 mod rsync;
 mod scan;
 mod session;
+mod session_progress;
 mod steam_appid;
 mod steam_catalog;
 #[cfg(test)]
@@ -55,62 +56,16 @@ fn dispatch_run(
     remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
 
     let steam_root = scan::find_steam_root();
-    let mut sink = display::pick_sink(sink_title);
-    let mut current_stage = None;
-    // Incidente real (2026-09-06): sem isto, a janela zenity de "Download"
-    // continuava flutuando por cima do jogo — que pode não ser fullscreen
-    // exclusivo aos olhos do compositor — durante a sessão inteira,
-    // sobrepondo a UI dele. `hidden` rastreia quando ela foi escondida de
-    // propósito ao entrar em `Running`, pra saber quando precisa nascer de
-    // novo (uma janela nova, não reaproveitada — `finish()` já matou o
-    // processo) ao entrar em `Upload`.
-    let mut hidden = false;
+    let mut progress = session_progress::SessionProgress::new(sink_title, cfg.server_name());
     let result = session::run_session(
         cfg,
         launcher,
         app_id,
         exec,
         steam_root.as_deref(),
-        |stage, update| {
-            if current_stage != Some(stage) {
-                current_stage = Some(stage);
-                let label = match stage {
-                    session::Stage::Download => format!("baixando do {}", cfg.server_name()),
-                    session::Stage::Running => "jogando".to_string(),
-                    session::Stage::Upload => format!("enviando para o {}", cfg.server_name()),
-                };
-                tracing::info!("{label}...");
-                if stage == session::Stage::Running {
-                    sink.finish();
-                    hidden = true;
-                } else if hidden {
-                    sink = display::pick_sink(sink_title);
-                    hidden = false;
-                }
-            }
-            if stage == session::Stage::Running {
-                // Janela já escondida acima — nada pra atualizar durante o
-                // jogo (sem percentual real nessa fase de qualquer forma).
-                return;
-            }
-            // Uma única barra 0-100% pra sessão inteira, não uma
-            // por transferência — sem isso, a barra "reinicia" do
-            // zero a cada estágio, o que parece um erro visual em
-            // vez do progresso real da sessão.
-            let scaled_percent = match stage {
-                session::Stage::Download => update.percent / 2,
-                session::Stage::Running => 50,
-                session::Stage::Upload => 50 + update.percent / 2,
-            };
-            sink.update(&crate::progress::ProgressUpdate {
-                percent: scaled_percent,
-                rate: update.rate,
-            });
-        },
+        |stage, update| progress.on_progress(stage, update),
     );
-    // Encerra o diálogo gráfico independentemente de sucesso ou
-    // falha — nunca deixa uma janela zenity órfã pendurada.
-    sink.finish();
+    progress.finish();
     let session = match result {
         Ok(session) => session,
         Err(err) => {
@@ -361,52 +316,15 @@ fn main() -> anyhow::Result<()> {
                     let app_id = app_id.to_string();
                     let steam_root = scan::find_steam_root();
                     let sink_title = format!("vault-sync — {}", entry.display_name);
-                    let mut sink = display::pick_sink(&sink_title);
-                    let mut current_stage = None;
-                    // Ver comentário equivalente em `dispatch_run`: sem
-                    // isto, a janela fica flutuando por cima do jogo a
-                    // sessão inteira.
-                    let mut hidden = false;
+                    let mut progress =
+                        session_progress::SessionProgress::new(&sink_title, cfg.server_name());
                     let result = session::run_via_steam_applaunch(
                         &cfg,
                         &app_id,
                         steam_root.as_deref(),
-                        |stage, update| {
-                            if current_stage != Some(stage) {
-                                current_stage = Some(stage);
-                                let label = match stage {
-                                    session::Stage::Download => {
-                                        format!("baixando do {}", cfg.server_name())
-                                    }
-                                    session::Stage::Running => "jogando".to_string(),
-                                    session::Stage::Upload => {
-                                        format!("enviando para o {}", cfg.server_name())
-                                    }
-                                };
-                                tracing::info!("{label}...");
-                                if stage == session::Stage::Running {
-                                    sink.finish();
-                                    hidden = true;
-                                } else if hidden {
-                                    sink = display::pick_sink(&sink_title);
-                                    hidden = false;
-                                }
-                            }
-                            if stage == session::Stage::Running {
-                                return;
-                            }
-                            let scaled_percent = match stage {
-                                session::Stage::Download => update.percent / 2,
-                                session::Stage::Running => 50,
-                                session::Stage::Upload => 50 + update.percent / 2,
-                            };
-                            sink.update(&crate::progress::ProgressUpdate {
-                                percent: scaled_percent,
-                                rate: update.rate,
-                            });
-                        },
+                        |stage, update| progress.on_progress(stage, update),
                     );
-                    sink.finish();
+                    progress.finish();
                     let session = match result {
                         Ok(session) => session,
                         Err(err) => {
