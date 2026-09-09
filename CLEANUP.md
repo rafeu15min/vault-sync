@@ -8,9 +8,9 @@
 >
 > **Status (2026-09-08)**: git inicializado (commit `15f99cf`, baseline
 > pré-limpeza). **Camadas 1, 2 e 3 executadas e commitadas** (`81cf920`,
-> `a08027f`..`b58c4eb`, `6066d5b`). Camada 4 (redesenho estrutural
-> opcional) continua como plano, pra execução futura — avaliar se ainda
-> parece valer a pena depois de 1-3. Achado ao longo da Camada 2, não
+> `a08027f`..`b58c4eb`, `6066d5b`). Camada 4 dissecada em 3 sub-fases
+> (ver seção própria abaixo) — **4.1 feita** (`b2b5724`), 4.2/4.3 não
+> decididas. Achado ao longo da Camada 2, não
 > relacionado a ela: `cargo test` sem `--test-threads=1` é
 > intermitentemente flaky (ETXTBSY em scripts fake recém-escritos) —
 > confirmado preexistente já no baseline da Camada 1, não introduzido nem
@@ -170,6 +170,31 @@ suíte de regressão):
 
 ## Camada 4 — redesenho estrutural, opcional, mais arriscado
 
+> **Dissecada em 2026-09-08** depois de estudar `run_ingest_with_options`
+> a fundo (a caracterização original abaixo, "três passadas", subestimava
+> a estrutura real). São **5 laços sequenciais**, não 3:
+> `run_steam_compatdata_pass` (Steam oficial **e** piratas juntos — a
+> categoria só é decidida dentro do laço, por qual override/manifesto
+> resolve), `run_steam_manifest_only_pass`, `run_pirata_manifest_only_pass`,
+> e um par agrupado sob `--heroic` (Heroic compatdata + Epic
+> manifest-only). Quebrada em 3 sub-fases de risco crescente:
+>
+> - **4.1 (feita, commit `b2b5724`)**: extração mecânica pura — as 5
+>   passadas viraram 4 funções privadas nomeadas (`run_epic_pass` agrupa
+>   as duas do lado Heroic/Epic), zero mudança de comportamento, núcleo
+>   duplicado deixado como estava. `run_ingest_with_options` caiu de
+>   ~870 pra ~80 linhas.
+> - **4.2 (não decidida)**: extrair só o núcleo "resolver → pular se
+>   compat tool → checar `already_remote` → `sync_full_install` →
+>   apagar → checar metadado obsoleto" pras 5 passadas chamarem, sem
+>   fundir os laços de descoberta externos (compatdata continua
+>   diferente de manifest-only).
+> - **4.3 (não decidida, opcional)**: fusão completa numa passada
+>   genérica parametrizada — onde os testes pareados
+>   (`full_manifest_only_entry_...` / `full_pirata_manifest_only_entry_
+>   ...`) colapsariam juntos. Maior risco, avaliar só se 4.2 ainda deixar
+>   isso parecendo valer a pena.
+
 - **`ingest.rs:918-1145` (+ passada Epic mais adiante no arquivo)** — três
   passadas quase idênticas (Steam oficial, piratas, Epic) repetindo
   "resolver instalação → pular se for ferramenta de compatibilidade →
@@ -191,7 +216,7 @@ suíte de regressão):
   `run_steam_manifest_only_pass`, `run_pirata_manifest_only_pass`,
   `run_epic_pass`) deixaria a função navegável sem mudar comportamento —
   extração pura, mais segura que a fusão acima, pode ser feita
-  independentemente dela.
+  independentemente dela. **Feito — ver nota acima.**
 
 ## O que foi investigado e decidido **não** tocar
 
