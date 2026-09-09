@@ -7,14 +7,16 @@
 > ligada a incidente real documentado.
 >
 > **Status (2026-09-08)**: git inicializado (commit `15f99cf`, baseline
-> pré-limpeza). **Camadas 1 e 2 executadas e commitadas** (`81cf920`,
-> `a08027f`..`b58c4eb`). Camadas 3-4 continuam como plano, pra execução
-> futura. Achado ao longo da Camada 2, não relacionado a ela: `cargo test`
-> sem `--test-threads=1` é intermitentemente flaky (ETXTBSY em scripts
-> fake recém-escritos) — confirmado preexistente já no baseline da Camada
-> 1, não introduzido nem corrigido por este polimento. Investigar
-> separadamente; `--test-threads=1` continua necessário pra confiar no
-> resultado localmente.
+> pré-limpeza). **Camadas 1, 2 e 3 executadas e commitadas** (`81cf920`,
+> `a08027f`..`b58c4eb`, `6066d5b`). Camada 4 (redesenho estrutural
+> opcional) continua como plano, pra execução futura — avaliar se ainda
+> parece valer a pena depois de 1-3. Achado ao longo da Camada 2, não
+> relacionado a ela: `cargo test` sem `--test-threads=1` é
+> intermitentemente flaky (ETXTBSY em scripts fake recém-escritos) —
+> confirmado preexistente já no baseline da Camada 1, não introduzido nem
+> corrigido por este polimento. Investigar separadamente;
+> `--test-threads=1` continua necessário pra confiar no resultado
+> localmente.
 
 ## Como isso foi levantado
 
