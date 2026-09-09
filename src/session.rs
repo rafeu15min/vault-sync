@@ -65,6 +65,13 @@ pub enum RunError {
         "'steam -applaunch {0}' não iniciou uma sessão visível (processo 'reaper' da Steam Linux Runtime) em tempo — a Steam pode ter mostrado um diálogo de erro; nada foi sincronizado de volta"
     )]
     SteamLaunchTimeout(String),
+    #[error(
+        "o processo encerrou em menos de {elapsed_secs}s com status de erro ({status}) — \
+         provavelmente nunca chegou a rodar de verdade (launcher recusando o lançamento, \
+         dependência ausente, config quebrada); nada foi sincronizado de volta. Rode o comando \
+         manualmente num terminal pra ver a mensagem de erro real"
+    )]
+    GameExitedImmediately { status: String, elapsed_secs: u64 },
 }
 
 /// Ciclo de vida completo de uma sessão (3.1 → 3.4): aquisição integral,
@@ -533,6 +540,14 @@ fn resolve_and_download(
     })
 }
 
+/// Um processo que sai com erro em menos deste tempo quase certamente nunca
+/// chegou a abrir de verdade (launcher recusando o lançamento, dependência
+/// ausente, config quebrada) — folga generosa acima do que qualquer engine
+/// leva só pra inicializar gráficos/áudio, pra não confundir com uma sessão
+/// de verdade que o Proton só encerra com um status não-zero (comportamento
+/// legítimo já documentado onde este limiar é checado).
+const GAME_EXIT_TOO_FAST_THRESHOLD: Duration = Duration::from_secs(5);
+
 #[allow(clippy::too_many_arguments)]
 fn run_session_with_options(
     cfg: &Config,
@@ -635,8 +650,25 @@ fn run_session_with_options(
 
     // 3.2/3.3: `.wait()` bloqueia via waitpid — custo de CPU zero na thread
     // orquestradora até o kernel notificar o término do processo filho.
+    let spawned_at = Instant::now();
     let status = child.wait().map_err(RunError::GameSpawn)?;
     if !status.success() {
+        // Incidente real (2026-09-09, Nobody Wants to Die): um Legendary
+        // que recusa o lançamento ("not currently installed" — installed.json
+        // sem a entrada, ver `ensure_legendary_knows_about_install_at`) sai
+        // com erro quase instantaneamente. Sem esta checagem, o ciclo seguia
+        // pra "sincronizado com sucesso" como se o jogo tivesse rodado —
+        // mascarando uma falha real atrás de um log que parecia êxito.
+        // Proton legitimamente às vezes sai com status estranho numa sessão
+        // de verdade (por isso o limiar generoso, não qualquer código != 0
+        // vira falha dura) — só trata como falha quando as duas coisas
+        // batem: saiu rápido demais E com erro.
+        if spawned_at.elapsed() < GAME_EXIT_TOO_FAST_THRESHOLD {
+            return Err(RunError::GameExitedImmediately {
+                status: status.to_string(),
+                elapsed_secs: spawned_at.elapsed().as_secs(),
+            });
+        }
         tracing::warn!(
             "processo do jogo encerrou com status {status:?} — sincronizando de volta mesmo assim"
         );
@@ -829,6 +861,100 @@ fn cmdline_has_marker(cmdline: &str, marker: &str) -> bool {
 const REAPER_GRACE_PERIOD: Duration = Duration::from_secs(90);
 const REAPER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// `comm` do processo real da Steam — `/usr/bin/steam` é só um wrapper de
+/// shell que executa `/usr/lib/steam/steam` (confirmado nesta máquina via
+/// `pacman -Qo`/leitura do script), então o nome que aparece em `/proc`
+/// reflete o binário final, não o wrapper.
+const STEAM_PROCESS_COMM: &str = "steam";
+/// Tempo de graça pra Steam terminar de inicializar depois que o processo
+/// aparece — só o processo existir não significa que a API/IPC interna já
+/// está pronta pra receber um `-applaunch` (ver `ensure_steam_running_
+/// silently`).
+const STEAM_WARMUP_GRACE: Duration = Duration::from_secs(3);
+/// Tempo máximo de espera pro processo da Steam aparecer num boot frio —
+/// bem mais generoso que o de sessão de jogo (`startup_timeout` de
+/// `wait_for_steam_session`), já que carregar a própria Steam do zero é
+/// mais pesado que só despachar um `-applaunch` pra uma instância já de pé.
+const STEAM_COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
+const STEAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn is_steam_process_running_in(proc_dir: &str) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let pid_str = entry.file_name().to_string_lossy().into_owned();
+        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
+            return false;
+        }
+        std::fs::read_to_string(entry.path().join("comm"))
+            .map(|c| c.trim() == STEAM_PROCESS_COMM)
+            .unwrap_or(false)
+    })
+}
+
+fn is_steam_process_running() -> bool {
+    is_steam_process_running_in("/proc")
+}
+
+/// Garante que a Steam já está rodando (mesmo escondida, via `-silent`)
+/// antes de qualquer `-applaunch` — sem isso, cada lançamento cold-starta a
+/// Steam inteira, o que (a) sempre mostra a janela principal por alguns
+/// segundos, mesmo pra quem só queria abrir direto o jogo, e (b)
+/// frequentemente estoura o tempo de espera do `reaper` num boot frio,
+/// fazendo o vault-sync reportar falha mesmo quando a Steam eventualmente
+/// teria conseguido (incidente real, 2026-09-09: Kenshi e Haste — dois
+/// jogos distintos, mesma falha, mesmo dia, porque nenhum dos dois
+/// lançamentos tinha uma Steam já de pé pra responder rápido). Se a Steam
+/// já estiver rodando, retorna na hora — só paga o custo de boot quando é
+/// mesmo necessário. Melhor esforço deliberado: mesmo sem confirmar que a
+/// Steam subiu a tempo, segue em frente — o `-applaunch` mais adiante
+/// ainda pode dar certo, e `wait_for_steam_session` é quem de fato decide
+/// se foi rápido o bastante.
+fn ensure_steam_running_silently(steam_bin: &str) {
+    ensure_steam_running_silently_with(
+        steam_bin,
+        STEAM_COLD_START_TIMEOUT,
+        STEAM_WARMUP_GRACE,
+        STEAM_POLL_INTERVAL,
+        is_steam_process_running,
+    );
+}
+
+/// Núcleo testável de `ensure_steam_running_silently`: `is_running`
+/// injetado em vez de tocar `/proc` diretamente — o caminho "já está
+/// rodando" (o único que os testes exercitam sem precisar de um binário
+/// fake de longa duração) nunca chega a spawnar `steam_bin`.
+fn ensure_steam_running_silently_with(
+    steam_bin: &str,
+    cold_start_timeout: Duration,
+    warmup_grace: Duration,
+    poll_interval: Duration,
+    mut is_running: impl FnMut() -> bool,
+) {
+    if is_running() {
+        return;
+    }
+    if std::process::Command::new(steam_bin)
+        .arg("-silent")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .is_err()
+    {
+        return;
+    }
+    let deadline = Instant::now() + cold_start_timeout;
+    while Instant::now() < deadline {
+        if is_running() {
+            std::thread::sleep(warmup_grace);
+            return;
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
 /// Espera a sessão real da Steam pra `app_id` aparecer (jogo realmente
 /// começou a subir sob o Steam Linux Runtime — cobre qualquer checagem/
 /// atualização que a Steam decida fazer antes) e depois desaparecer de vez
@@ -940,6 +1066,7 @@ fn run_via_steam_applaunch_with_options(
 
     let session = GameSession::new(source);
 
+    ensure_steam_running_silently("steam");
     Command::new("steam")
         .arg("-applaunch")
         .arg(app_id)
@@ -1120,6 +1247,60 @@ mod tests {
     }
 
     #[test]
+    fn is_steam_process_running_in_finds_a_process_named_steam() {
+        let dir = test_dir("proc-steam-running");
+        fake_proc_entry(&dir, 555, "steam", &["/usr/lib/steam/steam"]);
+        assert!(is_steam_process_running_in(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn is_steam_process_running_in_is_false_without_a_steam_process() {
+        let dir = test_dir("proc-steam-absent");
+        fake_proc_entry(&dir, 555, "bash", &["bash"]);
+        assert!(!is_steam_process_running_in(dir.to_str().unwrap()));
+    }
+
+    #[test]
+    fn ensure_steam_running_silently_with_never_spawns_when_already_running() {
+        // `steam_bin` aponta pra um caminho inexistente de propósito — se a
+        // função tentasse spawnar mesmo com a Steam já rodando, isso seria
+        // trabalho desperdiçado (o ponto do cache: só paga o custo de boot
+        // quando é mesmo necessário). Conta quantas vezes `is_running` foi
+        // chamado pra confirmar que o caminho "já rodando" é só uma checagem.
+        let mut calls = 0;
+        ensure_steam_running_silently_with(
+            "/caminho/que/nao/existe/de-jeito-nenhum",
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+            || {
+                calls += 1;
+                true
+            },
+        );
+        assert_eq!(calls, 1, "só deveria checar uma vez quando já está rodando");
+    }
+
+    #[test]
+    fn ensure_steam_running_silently_with_gives_up_after_cold_start_timeout() {
+        // `is_running` nunca fica `true` — simula uma Steam que nunca sobe.
+        // `steam_bin` = "true" (sempre sai com sucesso sem fazer nada) só
+        // pra confirmar que a função não trava além do timeout configurado.
+        let start = Instant::now();
+        ensure_steam_running_silently_with(
+            "true",
+            Duration::from_millis(100),
+            Duration::from_millis(1),
+            Duration::from_millis(10),
+            || false,
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "não deveria esperar muito além do cold_start_timeout configurado"
+        );
+    }
+
+    #[test]
     fn wait_for_steam_session_times_out_when_reaper_never_appears() {
         // AppID que nenhuma sessão real vai ter — contra o /proc de
         // verdade, então isso testa a função pública ponta a ponta pro
@@ -1246,6 +1427,58 @@ mod tests {
         assert!(
             !lock_path.exists(),
             "o lockfile deveria ter sido liberado no fim da sessão"
+        );
+    }
+
+    #[test]
+    fn game_exiting_immediately_with_an_error_is_a_hard_failure_not_a_silent_sync() {
+        // Regressão do incidente real (2026-09-09, Nobody Wants to Die): o
+        // Legendary recusou o lançamento ("not currently installed" — ver
+        // `ensure_legendary_knows_about_install_at`) e saiu com erro em
+        // menos de um segundo, mas o código de então tratava isso como uma
+        // sessão normal — sincronizava de volta e limpava o local como se o
+        // jogo tivesse rodado, mascarando a falha real atrás de um log que
+        // parecia êxito.
+        let work = test_dir("exit-too-fast");
+        let local_lib = work.join("ssd");
+        let compatdata = local_lib.join("steamapps").join("compatdata").join("730");
+        fs::create_dir_all(&compatdata).unwrap();
+        fs::write(compatdata.join("save.dat"), b"progresso").unwrap();
+
+        let rsync = always_succeeds_rsync(&work);
+        let lock_path = work.join("session.lock");
+
+        let cfg = base_config(&local_lib);
+        let exec = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "exit 7".to_string(),
+        ];
+
+        let result = run_session_with_options(
+            &cfg,
+            Launcher::Steam,
+            "730",
+            &exec,
+            None,
+            rsync.to_str().unwrap(),
+            "ssh",
+            &lock_path,
+            None,
+            |_, _| {},
+        );
+
+        assert!(
+            matches!(result, Err(RunError::GameExitedImmediately { .. })),
+            "esperava GameExitedImmediately, obteve {result:?}"
+        );
+        assert!(
+            compatdata.exists(),
+            "nada deveria ter sido sincronizado/limpo numa falha de lançamento"
+        );
+        assert!(
+            !lock_path.exists(),
+            "o lockfile deveria ter sido liberado mesmo numa falha (Drop do LockGuard)"
         );
     }
 
