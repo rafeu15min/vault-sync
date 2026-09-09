@@ -1174,6 +1174,27 @@ fn run_steam_manifest_only_pass(
                             // metadado obsoleto, sozinho ele deixa a Steam
                             // mostrando o jogo como instalado/corrompido
                             // por engano.
+                            //
+                            // Incidente real (2026-08-31/09-09, Kenshi):
+                            // este era o ÚLTIMO lugar em que o manifesto
+                            // ainda existia — nem local_game_root_steam nem
+                            // o retrato remoto (`steam-manifests/<id>.acf`)
+                            // sobreviveram além dele. Apagar sem garantir
+                            // primeiro um retrato remoto fresco destrói a
+                            // única cópia que `restore_official_manifest_
+                            // snapshot` teria pra restaurar da próxima vez
+                            // — o jogo então "esquece" de vez, obrigando
+                            // reconstrução manual do manifesto (feita à mão
+                            // na época). Reenviar aqui é barato (arquivo
+                            // pequeno, best-effort) e fecha essa lacuna de
+                            // vez.
+                            upload_manifest_snapshot(
+                                &vault.ssh_target,
+                                rsync_bin,
+                                base,
+                                local_lib,
+                                &app_id,
+                            );
                             let manifest = local_lib
                                 .join("steamapps")
                                 .join(format!("appmanifest_{app_id}.acf"));
@@ -1601,6 +1622,22 @@ fn run_epic_pass(
                                 // obsoleto, sozinho ele deixa o Heroic
                                 // mostrando "instalado" por engano pra
                                 // sempre.
+                                //
+                                // Mesmo raciocínio de `upload_manifest_
+                                // snapshot` na passada Steam acima
+                                // (incidente real do Kenshi): garante um
+                                // retrato remoto fresco do installed.json
+                                // ANTES de remover a entrada local — sem
+                                // isso, um título cujo installed.json local
+                                // nunca foi capturado num retrato remoto
+                                // perde o único registro de onde reinstalar
+                                // quando o Legendary "esquecer" o jogo de
+                                // novo.
+                                upload_legendary_installed_json_snapshot(
+                                    &vault.ssh_target,
+                                    rsync_bin,
+                                    base,
+                                );
                                 if install_paths::remove_legendary_installed_entry(json, &title)
                                     .map_err(|source| IngestError::StaleMetadataCleanup {
                                         title: title.clone(),
