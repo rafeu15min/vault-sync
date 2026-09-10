@@ -32,6 +32,18 @@ pub struct RemoteListing {
     /// depois de 100% migrado. `catalog::build_catalog_from` usa este campo
     /// pra reconhecer esse caso via `install_path_overrides.epic`.
     pub epic_installs: Option<Vec<String>>,
+    /// Nomes de pasta sob `remote_installs_base_path/steam` — instalações
+    /// completas Steam oficiais já confirmadas no servidor. Mesma convenção
+    /// de `piratas_installs`/`epic_installs` (`None` quando
+    /// `remote_installs_base_path` não está configurado). Existe porque
+    /// `steam_compatdata_ids` só cobre `compatdata` (save/prefixo Proton) —
+    /// um jogo oficial cujo compatdata nunca foi sincronizado de volta (ou
+    /// se perdeu) fica invisível no catálogo mesmo com a instalação
+    /// completa 100% no servidor (incidente real, 2026-09-09: Kenshi —
+    /// mesma classe de bug do Chivalry 2/Epic que motivou
+    /// `epic_installs`, só que do lado Steam, que nunca ganhou o
+    /// equivalente até agora).
+    pub steam_installs: Option<Vec<String>>,
 }
 
 /// Consulta o FeuVault de verdade e, se bem-sucedida, grava a listagem em
@@ -124,11 +136,25 @@ fn run_list_with_options(cfg: &Config, ssh_bin: &str) -> Result<RemoteListing, R
         None => None,
     };
 
+    let steam_installs = match &cfg.remote_installs_base_path {
+        Some(base) => {
+            let mut names = remote::list_remote_dir_entries(
+                ssh_bin,
+                &cfg.remote_ssh_target,
+                &base.join("steam"),
+            )?;
+            names.sort();
+            Some(names)
+        }
+        None => None,
+    };
+
     Ok(RemoteListing {
         steam_compatdata_ids,
         heroic_titles,
         piratas_installs,
         epic_installs,
+        steam_installs,
     })
 }
 
@@ -260,6 +286,33 @@ mod tests {
     }
 
     #[test]
+    fn omits_steam_installs_when_remote_installs_base_path_unconfigured() {
+        let dir = test_dir("steam-installs-unconfigured");
+        let ssh = fake_ssh(&dir, "printf ''");
+
+        let listing = run_list_with_options(&cfg_steam_only(), ssh.to_str().unwrap()).unwrap();
+
+        assert_eq!(listing.steam_installs, None);
+    }
+
+    #[test]
+    fn lists_steam_installs_when_configured() {
+        let dir = test_dir("steam-installs-configured");
+        let ssh = fake_ssh(&dir, "printf 'Kenshi\\nHaste\\n'");
+        let cfg = Config {
+            remote_installs_base_path: Some(std::path::PathBuf::from("/vault/game-installs")),
+            ..cfg_steam_only()
+        };
+
+        let listing = run_list_with_options(&cfg, ssh.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            listing.steam_installs,
+            Some(vec!["Haste".to_string(), "Kenshi".to_string()])
+        );
+    }
+
+    #[test]
     fn cache_round_trips_a_written_listing() {
         let dir = test_dir("cache-round-trip");
         let path = dir.join("remote_catalog_cache.json");
@@ -268,6 +321,7 @@ mod tests {
             heroic_titles: Some(vec!["Disco Elysium".to_string()]),
             piratas_installs: Some(vec!["Haste".to_string()]),
             epic_installs: Some(vec!["DiscoElysium".to_string()]),
+            steam_installs: Some(vec!["Kenshi".to_string()]),
         };
 
         write_cache_to(&path, &listing);

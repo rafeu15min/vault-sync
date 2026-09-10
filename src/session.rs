@@ -149,6 +149,33 @@ fn detect_full_install(
                 return Ok((Some(root.clone()), Some(target)));
             }
         }
+
+        // Nem manifesto local nem retrato remoto sobreviveram (incidente
+        // real, 2026-09-09: Kenshi — `compatdata` só local, `appmanifest`
+        // nunca foi enviado ao FeuVault, então não há retrato pra
+        // restaurar). `install_path_overrides.steam` é o único mapeamento
+        // app_id<->pasta que sobrevive a essa lacuna dupla, mesmo raciocínio
+        // de `install_path_overrides.piratas` logo abaixo — sem ele, um
+        // jogo oficial nessa situação nunca teria como saber onde baixar a
+        // instalação completa, mesmo já reconhecido no catálogo (ver
+        // `catalog::augment_remote_with_full_install_only_steam_titles`).
+        if let Some(local_dir) = cfg.install_path_overrides.steam.get(app_id) {
+            if install_paths::is_safe_install_dir(local_dir, dirs::home_dir().as_deref()) {
+                let remote_base = cfg
+                    .remote_installs_base_path
+                    .clone()
+                    .ok_or_else(|| RunError::FullInstallNotConfigured(app_id.to_string()))?;
+                let name = local_dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| app_id.to_string());
+                let target = FullInstallTarget {
+                    local_dir: local_dir.clone(),
+                    remote_dir: remote_base.join("steam").join(name),
+                };
+                return Ok((Some(root.clone()), Some(target)));
+            }
+        }
     }
 
     // Override manual > raiz adotada (`local_game_root_piratas`) > `StartDir`
@@ -2170,6 +2197,46 @@ mod tests {
         assert!(fs::read_to_string(restored_manifest)
             .unwrap()
             .contains("Jogo Restaurado"));
+    }
+
+    #[test]
+    fn detect_full_install_falls_back_to_steam_override_when_no_manifest_survives_anywhere() {
+        // Regressão real (2026-09-09): Kenshi tinha `compatdata` só local
+        // (nunca sincronizado ao FeuVault, então não há retrato remoto pra
+        // restaurar) e nenhum `appmanifest_233860.acf` local — sem esse
+        // fallback, `detect_full_install` devolvia `(_, None)` e o jogo
+        // nunca sabia de onde baixar a instalação completa, mesmo com
+        // `install_path_overrides.steam` configurado apontando pra ela.
+        let work = test_dir("detect-full-install-steam-override-fallback");
+        let steam_full_root = work.join("steam-full");
+        fs::create_dir_all(
+            steam_full_root
+                .join("steamapps")
+                .join("compatdata")
+                .join("233860"),
+        )
+        .unwrap();
+        // Nenhum appmanifest_233860.acf local — é exatamente esse o gap.
+
+        let ssh_fails = write_script(&work, "fake-ssh-no-snapshot.sh", "exit 1");
+        let remote_installs = work.join("remote-installs");
+        let override_dir = steam_full_root
+            .join("steamapps")
+            .join("common")
+            .join("Kenshi");
+        let mut cfg =
+            cfg_with_full_install_steam(&steam_full_root, &steam_full_root, &remote_installs);
+        cfg.install_path_overrides
+            .steam
+            .insert("233860".to_string(), override_dir.clone());
+
+        let (library_override, full_install) =
+            detect_full_install(&cfg, "233860", None, ssh_fails.to_str().unwrap()).unwrap();
+
+        assert_eq!(library_override, Some(steam_full_root.clone()));
+        let target = full_install.expect("esperava um FullInstallTarget vindo do override");
+        assert_eq!(target.local_dir, override_dir);
+        assert_eq!(target.remote_dir, remote_installs.join("steam").join("Kenshi"));
     }
 
     #[test]

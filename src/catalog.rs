@@ -182,6 +182,7 @@ fn build_catalog_from(cfg: &Config, remote: list::RemoteListing) -> Result<Catal
     );
 
     let remote = augment_remote_with_full_install_only_epic_titles(cfg, remote);
+    let remote = augment_remote_with_full_install_only_steam_titles(cfg, remote);
 
     Ok(merge_catalog(local_sources, &remote, |source| {
         resolve_display_name(cfg, source)
@@ -228,6 +229,52 @@ fn augment_remote_with_full_install_only_epic_titles(
     titles.extend(extra);
     titles.sort();
     remote.heroic_titles = Some(titles);
+    remote
+}
+
+/// Mesmo raciocínio de `augment_remote_with_full_install_only_epic_titles`,
+/// do lado Steam oficial: reconhece jogos cuja única presença remota é a
+/// instalação completa (`remote.steam_installs`) quando o `compatdata`
+/// nunca foi sincronizado de volta (ou se perdeu — `steam_compatdata_ids`
+/// não sabe nada sobre eles). Sem isto, um jogo assim fica invisível no
+/// catálogo mesmo 100% presente no servidor (incidente real, 2026-09-09:
+/// Kenshi — compatdata só local, nunca existiu remoto; instalação completa
+/// só remota, nunca local — nenhum dos dois lados bastava sozinho pro
+/// catálogo antigo reconhecer o jogo). `install_path_overrides.steam`
+/// (app_id -> pasta local) é o único mapeamento app_id<->nome-de-pasta que
+/// sobrevive a essa lacuna dupla; sem override configurado pra esse app_id,
+/// não tem como saber o nome da pasta remota, e ele continua invisível
+/// (mesmo comportamento de antes, sem regressão pra quem não configurou
+/// nada).
+fn augment_remote_with_full_install_only_steam_titles(
+    cfg: &Config,
+    mut remote: list::RemoteListing,
+) -> list::RemoteListing {
+    let Some(steam_installs) = &remote.steam_installs else {
+        return remote;
+    };
+    let already_known: HashSet<&str> = remote
+        .steam_compatdata_ids
+        .iter()
+        .map(String::as_str)
+        .collect();
+    let extra: Vec<String> = cfg
+        .install_path_overrides
+        .steam
+        .iter()
+        .filter(|(app_id, _)| !already_known.contains(app_id.as_str()))
+        .filter(|(_, path)| {
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .is_some_and(|n| steam_installs.contains(&n))
+        })
+        .map(|(app_id, _)| app_id.clone())
+        .collect();
+    if extra.is_empty() {
+        return remote;
+    }
+    remote.steam_compatdata_ids.extend(extra);
+    remote.steam_compatdata_ids.sort();
     remote
 }
 
@@ -353,9 +400,22 @@ pub(crate) fn merge_catalog(
     for app_id in &remote.steam_compatdata_ids {
         let key = format!("steam:{app_id}");
         remote_keys.insert(key.clone());
-        sources
+        let entry = sources
             .entry(key)
             .or_insert_with(|| placeholder_steam_source(app_id));
+        // `Orphan` é só "não deu pra classificar com o que via local" — o
+        // FeuVault confirmando esse mesmo app_id assume identidade real
+        // (Official/NonSteamShortcut), então substitui em vez de deixar
+        // `or_insert_with` (que só age quando a chave está livre) manter um
+        // orfão pra sempre invisível no menu (`is_launchable` == false pra
+        // Orphan). Incidente real, 2026-09-09: Kenshi tinha `compatdata`
+        // local sem manifesto (Orphan) E `compatdata` remoto confirmado — o
+        // app_id ocupava a mesma chave `dedup_key` dos dois lados, então o
+        // orfão local vencia e o jogo sumia do SUPER+G mesmo com o servidor
+        // sabendo exatamente o que ele é.
+        if matches!(entry, GameSource::Orphan { .. }) {
+            *entry = placeholder_steam_source(app_id);
+        }
     }
     for title in remote.heroic_titles.iter().flatten() {
         let key = format!("heroic:{title}");
@@ -486,6 +546,7 @@ mod tests {
                 .map(|titles| titles.iter().map(|s| s.to_string()).collect()),
             piratas_installs: None,
             epic_installs: None,
+            steam_installs: None,
         }
     }
 
@@ -533,6 +594,29 @@ mod tests {
         });
         assert_eq!(catalog.entries.len(), 1);
         assert_eq!(catalog.entries[0].location, GameLocation::Both);
+    }
+
+    #[test]
+    fn remote_confirmation_upgrades_a_local_orphan_into_a_launchable_official_game() {
+        // Regressão real (2026-09-09): Kenshi tinha `compatdata` local sem
+        // `appmanifest` (por isso classificado `Orphan` por `scan.rs`) E
+        // `compatdata` confirmado no FeuVault — antes deste fix, o `Orphan`
+        // local ocupava a chave e o app_id ficava invisível no menu mesmo
+        // com o servidor confirmando de que jogo se trata.
+        let orphan = GameSource::Orphan {
+            app_id: "233860".to_string(),
+            clues: vec![],
+        };
+        let catalog = merge_catalog(vec![orphan], &remote(&["233860"], None), |s| {
+            (s.display_name(), true)
+        });
+        assert_eq!(catalog.entries.len(), 1);
+        assert_eq!(catalog.entries[0].location, GameLocation::Both);
+        assert!(matches!(
+            catalog.entries[0].source,
+            GameSource::Official { app_id: 233860 }
+        ));
+        assert!(catalog.entries[0].is_launchable());
     }
 
     #[test]
@@ -679,5 +763,63 @@ mod tests {
         let augmented = augment_remote_with_full_install_only_epic_titles(&cfg, remote);
 
         assert_eq!(augmented.heroic_titles, None);
+    }
+
+    fn cfg_with_steam_override(app_id: &str, basename: &str) -> Config {
+        let mut cfg = Config::test_default();
+        cfg.install_path_overrides.steam.insert(
+            app_id.to_string(),
+            std::path::PathBuf::from(format!("/qualquer/{basename}")),
+        );
+        cfg
+    }
+
+    #[test]
+    fn augment_recognizes_steam_game_present_only_as_a_full_install() {
+        // Regressão real (2026-09-09): Kenshi tinha `compatdata` só local
+        // (nunca sincronizado de volta) e instalação completa só remota —
+        // nenhum dos dois lados sozinho bastava pro catálogo antigo
+        // reconhecer o jogo, que sumiu do SUPER+G. `install_path_overrides
+        // .steam` é o que permite reconhecer esse caso sem depender de
+        // `compatdata` remoto existir.
+        let cfg = cfg_with_steam_override("233860", "Kenshi");
+        let mut remote = remote(&[], None);
+        remote.steam_installs = Some(vec!["Kenshi".to_string()]);
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, vec!["233860".to_string()]);
+    }
+
+    #[test]
+    fn augment_does_not_duplicate_an_app_id_already_known_via_compatdata() {
+        let cfg = cfg_with_steam_override("233860", "Kenshi");
+        let mut remote = remote(&["233860"], None);
+        remote.steam_installs = Some(vec!["Kenshi".to_string()]);
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, vec!["233860".to_string()]);
+    }
+
+    #[test]
+    fn augment_ignores_steam_override_whose_basename_is_not_confirmed_remotely() {
+        let cfg = cfg_with_steam_override("999999", "JogoNuncaEnviado");
+        let mut remote = remote(&[], None);
+        remote.steam_installs = Some(vec!["OutroJogo".to_string()]);
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, Vec::<String>::new());
+    }
+
+    #[test]
+    fn augment_steam_is_a_noop_when_remote_installs_base_path_is_not_configured() {
+        let cfg = cfg_with_steam_override("233860", "Kenshi");
+        let remote = remote(&[], None); // steam_installs: None
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, Vec::<String>::new());
     }
 }
