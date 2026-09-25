@@ -243,6 +243,59 @@ fn main() -> anyhow::Result<()> {
                 &format!("vault-sync — AppID {app_id}"),
             )?;
         }
+        Command::Pull {
+            app_id,
+            steam,
+            heroic,
+        } => {
+            let cfg = require_config(cfg, "pull")?;
+            let launcher = if heroic {
+                Launcher::Heroic
+            } else {
+                debug_assert!(steam);
+                Launcher::Steam
+            };
+
+            remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
+
+            let steam_root = scan::find_steam_root();
+            let sink_title = format!("vault-sync — pull {app_id}");
+            let mut progress = session_progress::SessionProgress::new(&sink_title, cfg.server_name());
+            let result = session::pull_full_install(
+                &cfg,
+                launcher,
+                &app_id,
+                steam_root.as_deref(),
+                |stage, update| progress.on_progress(stage, update),
+            );
+            progress.finish();
+
+            let local_dir = match result {
+                Ok(local_dir) => local_dir,
+                Err(err) => {
+                    tracing::error!("'pull {app_id}' falhou: {err}");
+                    display::notify_result(
+                        &sink_title,
+                        &format!("Falha ao trazer '{app_id}' do {}:\n{err}", cfg.server_name()),
+                        true,
+                    );
+                    return Err(err.into());
+                }
+            };
+
+            let report = match local_dir {
+                Some(dir) => format!(
+                    "'{app_id}' pronto em {} — abra a Steam/Heroic normalmente, sem baixar nada de novo.",
+                    dir.display()
+                ),
+                None => format!(
+                    "'{app_id}': compatdata sincronizado do {} (sem instalação completa rastreada pra este app_id).",
+                    cfg.server_name()
+                ),
+            };
+            println!("[vault-sync] 'pull {app_id}' concluído: {report}");
+            display::notify_result(&format!("vault-sync — pull {app_id} concluído"), &report, false);
+        }
         Command::Catalog { format } => {
             let cfg = require_config(cfg, "catalog")?;
             // Deliberadamente sem `ensure_reachable` aqui — este comando

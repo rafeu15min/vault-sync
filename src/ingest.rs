@@ -292,35 +292,48 @@ fn purge_old_manifest(old_manifest: &Path, id_for_error: &str) -> Result<(), Ing
 /// preservaria também. Universal: roda pra qualquer jogo Steam oficial
 /// com instalação completa rastreada, não um caso especial.
 ///
+/// Também chamada por `session::upload_and_cleanup` (ver lá) — não é mais
+/// exclusiva do `ingest` agendado, ver incidente 2026-09-20/21 abaixo.
+///
 /// Melhor esforço deliberado: sem manifesto local pra copiar (alguns jogos
 /// rastreados só por override nunca tiveram um — ver `install_paths.rs`,
 /// caso real do Echoes of Aincrad), ou falha de rede, só registra um aviso
 /// — nunca derruba o `ingest` inteiro por causa de uma rede de segurança
-/// auxiliar à instalação completa (essa sim, um erro duro).
-fn upload_manifest_snapshot(
+/// auxiliar à instalação completa (essa sim, um erro duro). Devolve `true`
+/// quando é seguro assumir que o FeuVault está com um retrato atualizado
+/// (upload confirmado, ou não havia manifesto local pra começar — nesse
+/// caso não há nada pra `session::upload_and_cleanup` proteger apagando
+/// por cautela) e `false` só quando havia manifesto local e o upload
+/// falhou de verdade — sinal pro chamador não apagar a única cópia que
+/// resta.
+pub(crate) fn upload_manifest_snapshot(
     ssh_target: &str,
     rsync_bin: &str,
     remote_installs_base_path: &Path,
     local_lib: &Path,
     app_id: &str,
-) {
+) -> bool {
     let local_manifest = local_lib
         .join("steamapps")
         .join(format!("appmanifest_{app_id}.acf"));
     if !local_manifest.is_file() {
-        return;
+        return true;
     }
     let remote_manifest = remote_installs_base_path
         .join("steam-manifests")
         .join(format!("{app_id}.acf"));
-    if let Err(e) = RsyncTransfer::upload_single_file(ssh_target, &local_manifest, &remote_manifest)
+    match RsyncTransfer::upload_single_file(ssh_target, &local_manifest, &remote_manifest)
         .with_binary(rsync_bin)
         .execute_with_progress(|_| {})
     {
-        tracing::warn!(
-            app_id,
-            "falha ao salvar retrato do manifesto no servidor: {e}"
-        );
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                app_id,
+                "falha ao salvar retrato do manifesto no servidor: {e}"
+            );
+            false
+        }
     }
 }
 

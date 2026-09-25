@@ -50,6 +50,29 @@ pub enum Command {
         heroic: bool,
     },
 
+    /// Traz a instalação completa de um jogo já rastreado (compatdata +
+    /// instalação, quando houver) do servidor pro SSD local, sem lançar o
+    /// jogo nem esperar execução nenhuma — o par oficial do `run`, que faz a
+    /// mesma coisa mas some dentro do ciclo de jogar. Pensado pra resolver o
+    /// caso em que a Steam já decidiu (por conta própria, ex.: clicou em
+    /// "Atualizar" na biblioteca) que o jogo precisa de download completo
+    /// via CDN da Valve mesmo com a instalação já pronta no servidor — rode
+    /// isto primeiro pra trazer os bytes certos localmente, depois abra a
+    /// Steam normalmente.
+    #[command(group(ArgGroup::new("launcher_pull").required(true).args(["steam", "heroic"])))]
+    Pull {
+        /// AppID do jogo (Steam) ou título da pasta em Prefixes/default (Heroic)
+        app_id: String,
+
+        /// `app_id` é um AppID numérico da Steam
+        #[arg(long)]
+        steam: bool,
+
+        /// `app_id` é o título de um prefixo Heroic (Prefixes/default/<título>)
+        #[arg(long)]
+        heroic: bool,
+    },
+
     /// Remove definitivamente um jogo do servidor e apaga os registros
     /// locais correspondentes. (Motor: Fase V; Heroic: Fase VI)
     #[command(group(ArgGroup::new("launcher_purge").required(true).args(["steam", "heroic"])))]

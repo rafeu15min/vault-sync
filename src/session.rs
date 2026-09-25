@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 /// `compatdata`). `None` sempre que o rastreamento não está configurado ou
 /// não pôde ser detectado pra este `app_id` — nesse caso `run` se comporta
 /// exatamente como antes da Fase VII (só compatdata).
+#[derive(Debug, PartialEq, Eq)]
 struct FullInstallTarget {
     local_dir: PathBuf,
     remote_dir: PathBuf,
@@ -111,11 +112,13 @@ pub fn run_session(
 /// biblioteca local que deve ser usada (em vez de `local_libraries.first()`)
 /// pra manter `compatdata`/manifesto/instalação sempre co-localizados,
 /// exigência real do Proton (não é só organização). Tenta oficial primeiro
-/// (`local_game_root_steam` + manifesto — nunca apagado por `run` uma vez
-/// rastreado, ver `cleanup_local`), depois pirata (ver
-/// `scan::resolve_piratas_install_dir` pra prioridade completa — nunca
-/// apagado por `run`). Sem nenhum dos dois configurados/resolvíveis:
-/// `None`, comportamento idêntico ao pré-Fase VII.
+/// (`local_game_root_steam` + manifesto — reenviado ao FeuVault e só então
+/// apagado por `run` ao fim de cada sessão, ver `upload_and_cleanup`;
+/// restaurado de lá sozinho na próxima vez que faltar, logo abaixo), depois
+/// pirata (ver `scan::resolve_piratas_install_dir` pra prioridade completa
+/// — esse nunca é apagado por `run`, não tem retrato remoto equivalente).
+/// Sem nenhum dos dois configurados/resolvíveis: `None`, comportamento
+/// idêntico ao pré-Fase VII.
 fn detect_full_install(
     cfg: &Config,
     app_id: &str,
@@ -220,6 +223,30 @@ fn detect_full_install(
     }
 
     Ok((None, None))
+}
+
+/// Devolve `Some(&full)` quando `app_id` tem instalação completa rastreada
+/// (`full_install`) mas nenhum `appmanifest_<app_id>.acf` existe em
+/// `local_game_root_steam` agora — o gatilho exato pra rodar `vault-sync
+/// update` (steamcmd validate) antes do `-applaunch` (ver chamador em
+/// `run_via_steam_applaunch_with_options`). `None` em qualquer outro caso
+/// (sem instalação completa rastreada, sem `local_game_root_steam`
+/// configurado, ou manifesto já presente) — nesses casos o `-applaunch`
+/// sozinho já funciona normalmente, sem custo extra de rede.
+fn full_install_missing_steam_manifest<'a>(
+    cfg: &Config,
+    app_id: &str,
+    full_install: &'a Option<FullInstallTarget>,
+) -> Option<&'a FullInstallTarget> {
+    let full = full_install.as_ref()?;
+    let root = cfg.local_game_root_steam.as_ref()?;
+    let manifest_path = root
+        .join("steamapps")
+        .join(format!("appmanifest_{app_id}.acf"));
+    if manifest_path.exists() {
+        return None;
+    }
+    Some(full)
 }
 
 /// Busca, no FeuVault, o `appmanifest_<app_id>.acf` salvo por `ingest.rs`
@@ -398,6 +425,29 @@ struct ResolvedSession {
     _lock: LockGuard,
 }
 
+/// Verdadeiro se `dir` (ou qualquer subpasta dele, recursivamente) contém
+/// pelo menos um arquivo comum. Usado pra distinguir uma instalação real
+/// (mesmo parcial) de uma árvore de pastas vazia que a Steam cria sozinha
+/// antes de começar a baixar algo — sem depender do tamanho esperado de
+/// nenhum jogo específico, então funciona igual pra qualquer AppID.
+fn dir_has_any_file(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_file() {
+            return true;
+        }
+        if file_type.is_dir() && dir_has_any_file(&entry.path()) {
+            return true;
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn resolve_and_download(
     cfg: &Config,
@@ -527,14 +577,32 @@ fn resolve_and_download(
 
     // Fase VII: instalação completa, só quando rastreada — mesma barreira
     // (falha de rede bloqueia antes do jogo abrir). Pulado quando o
-    // diretório já existe local (jogo "em casa" de uma sessão anterior que
-    // não chegou a fechar, ou primeira adoção onde a Steam/Heroic acabaram
-    // de instalar ali direto — nada a baixar). Também é o que "traz de
-    // volta" uma instalação fantasma (manifesto presente, pasta ausente —
-    // ver incidente do Cyberpunk 2077: `full.local_dir.exists()` é sempre
-    // checado no disco de verdade, nunca confia no manifesto da Steam).
+    // diretório já existe local E tem pelo menos um arquivo de verdade
+    // dentro (jogo "em casa" de uma sessão anterior que não chegou a
+    // fechar, ou primeira adoção onde a Steam/Heroic acabaram de instalar
+    // ali direto — nada a baixar). Também é o que "traz de volta" uma
+    // instalação fantasma (manifesto presente, pasta ausente — ver
+    // incidente do Cyberpunk 2077 em 2026-09-12: `full.local_dir.exists()`
+    // é sempre checado no disco de verdade, nunca confia no manifesto da
+    // Steam).
+    //
+    // Incidente real (2026-09-20, Cyberpunk 2077 de novo): a Steam já tinha
+    // criado a árvore de pastas do jogo (bin/, engine/, r6/, archive/...)
+    // sozinha ao começar um download próprio pela CDN antes de `run` rodar
+    // — pasta existe, mas vazia (zero arquivos). `local_dir.exists() ==
+    // true` sozinho bastava pra pular o download do servidor inteiro,
+    // deixando a instalação eternamente vazia (loop de `-applaunch`
+    // falhando por nunca achar o jogo de verdade — ver
+    // `SteamLaunchTimeout`). `dir_has_any_file` cobre isso sem precisar
+    // saber o tamanho esperado de nenhum jogo específico: qualquer
+    // instalação real tem arquivo, uma árvore de pastas fantasma da Steam
+    // não tem nenhum.
     if let Some(full) = &full_install {
-        if !full.local_dir.exists() {
+        let already_present = full.local_dir.exists() && dir_has_any_file(&full.local_dir);
+        if !already_present {
+            if full.local_dir.exists() {
+                let _ = std::fs::remove_dir_all(&full.local_dir);
+            }
             if let Err(err) =
                 RsyncTransfer::full_download(&vault.ssh_target, &full.remote_dir, &full.local_dir)
                     .with_binary(rsync_bin)
@@ -702,6 +770,7 @@ fn run_session_with_options(
     }
 
     upload_and_cleanup(
+        cfg,
         &session.source,
         &vault,
         &local_targets,
@@ -718,18 +787,36 @@ fn run_session_with_options(
 /// 3.3/3.4: sincronização diferencial de volta (estritamente sobre
 /// compatdata + instalação completa rastreada, nunca a biblioteca inteira)
 /// seguida de limpeza local — só chega a limpar com o(s) upload(s)
-/// confirmado(s) (exit code 0). Com instalação completa rastreada, o
-/// manifesto (Steam oficial) é preservado — é a única memória persistente
-/// do mapeamento app_id→pasta entre sessões (ver `detect_full_install`);
-/// sem rastreamento, comportamento idêntico ao pré-Fase VII (manifesto
-/// sempre apagado). Extraído pra ser reaproveitado tanto por
-/// `run_session_with_options` (jogo controlado diretamente) quanto por
-/// `run_via_steam_applaunch_with_options` (jogo controlado via `steam
-/// -applaunch` + supervisão do `reaper`) — a garantia de "só sincroniza
-/// depois que o jogo de verdade fechou" é idêntica nos dois casos, só o
-/// jeito de detectar o fechamento muda.
+/// confirmado(s) (exit code 0).
+///
+/// Incidente real (2026-09-20/21, Cyberpunk 2077): antes, o manifesto
+/// (Steam oficial) de uma instalação completa rastreada era sempre
+/// preservado localmente após a limpeza — única memória persistente do
+/// mapeamento app_id→pasta entre sessões (ver `detect_full_install`), pra
+/// evitar o incidente de 2026-08-30 onde a própria Steam "esquecia"
+/// sozinha o jogo. Só que isso tem um efeito colateral pior: um manifesto
+/// presente sem os arquivos do jogo (que `run` acabou de apagar de
+/// propósito) faz a Steam achar que a instalação está corrompida/faltando
+/// e disparar um download completo pela CDN da Valve — ignorando
+/// completamente que os dados certos estão no servidor. Agora o manifesto
+/// é enviado pro FeuVault (mesmo retrato que `ingest::upload_manifest_snapshot`
+/// já mantinha, só que aqui, dentro do próprio ciclo do `run`, sem
+/// depender de quando um `ingest --full` rodou por último) e só então
+/// apagado local — `detect_full_install`/`restore_official_manifest_snapshot`
+/// já sabiam restaurar esse retrato quando o manifesto local está ausente,
+/// então a próxima sessão recupera sozinha, sem a Steam nunca ver um
+/// manifesto órfão apontando pro nada. Se o upload falhar (rede instável),
+/// o manifesto local é preservado como estava antes — sem os dois lados
+/// nunca fica de propósito.
+///
+/// Extraído pra ser reaproveitado tanto por `run_session_with_options`
+/// (jogo controlado diretamente) quanto por `run_via_steam_applaunch_with_options`
+/// (jogo controlado via `steam -applaunch` + supervisão do `reaper`) — a
+/// garantia de "só sincroniza depois que o jogo de verdade fechou" é
+/// idêntica nos dois casos, só o jeito de detectar o fechamento muda.
 #[allow(clippy::too_many_arguments)]
 fn upload_and_cleanup(
+    cfg: &Config,
     source: &GameSource,
     vault: &RemoteVault,
     local_targets: &LocalDeletionTargets,
@@ -773,7 +860,28 @@ fn upload_and_cleanup(
         }
     }
 
-    cleanup_local(local_targets, full_install.is_some())?;
+    // Só jogos Steam oficiais têm manifesto pra proteger — `GameSource::HeroicGame`
+    // e piratas não passam por `appmanifest_*.acf` nenhum.
+    let manifest_safe_to_drop = match (source, full_install, &cfg.local_game_root_steam) {
+        (GameSource::Official { app_id }, Some(_), Some(local_game_root_steam)) => {
+            match &cfg.remote_installs_base_path {
+                Some(remote_installs_base_path) => crate::ingest::upload_manifest_snapshot(
+                    &vault.ssh_target,
+                    rsync_bin,
+                    remote_installs_base_path,
+                    local_game_root_steam,
+                    &app_id.to_string(),
+                ),
+                // Sem `remote_installs_base_path` configurado, o resto da
+                // Fase VII (instalação completa) já nem se aplicaria aqui
+                // (`full_install` só vem `Some` quando esse campo existe —
+                // ver `detect_full_install`) — mantido só por exaustividade.
+                None => true,
+            }
+        }
+        _ => true,
+    };
+    cleanup_local(local_targets, full_install.is_some() && !manifest_safe_to_drop)?;
     if let Some(full) = full_install {
         if full.local_dir.exists() {
             std::fs::remove_dir_all(&full.local_dir).map_err(RunError::Cleanup)?;
@@ -885,7 +993,18 @@ fn cmdline_has_marker(cmdline: &str, marker: &str) -> bool {
 /// atrasar em segundos quando o jogo fecha de verdade; custo de errar pra
 /// menos é apagar um jogo que ainda estava abrindo — a assimetria manda
 /// pecar por excesso de margem.
-const REAPER_GRACE_PERIOD: Duration = Duration::from_secs(90);
+///
+/// Terceiro incidente real (2026-09-12, Cyberpunk 2077): 90s de novo não
+/// bastou — a compilação de shaders de um jogo AAA grande (pior ainda logo
+/// após a Steam ter acabado de validar/reparar a instalação inteira, cache
+/// de shader zerado) passa fácil de um minuto e meio. Resultado idêntico ao
+/// incidente do Kenshi: upload+limpeza disparou com o jogo ainda no meio da
+/// compilação, apagando os 67GB da instalação completa local (o compatdata
+/// já tinha sincronizado a tempo, então nenhum dado de save/registro se
+/// perdeu — só a instalação, que precisa ser baixada de novo do FeuVault).
+/// Mesma assimetria de custo do incidente anterior, só que agora pesando
+/// mais pro lado de "espera mais": subiu de 90s pra 10 minutos.
+const REAPER_GRACE_PERIOD: Duration = Duration::from_secs(600);
 const REAPER_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `comm` do processo real da Steam — `/usr/bin/steam` é só um wrapper de
@@ -904,6 +1023,21 @@ const STEAM_WARMUP_GRACE: Duration = Duration::from_secs(3);
 /// mais pesado que só despachar um `-applaunch` pra uma instância já de pé.
 const STEAM_COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const STEAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Tempo máximo de espera pro `reaper` aparecer pela primeira vez depois de
+/// um `-applaunch` pelo menu (`run_via_steam_applaunch`) — separado de
+/// `REAPER_GRACE_PERIOD`, que só conta depois que o reaper já apareceu ao
+/// menos uma vez (ver comentário de `wait_for_steam_session`). Incidente
+/// real (2026-09-18, Risk of Rain 2): a Steam decidiu baixar uma atualização
+/// pendente antes de lançar o jogo — nenhum `reaper` chega a existir
+/// enquanto o download roda, então os 60s antigos estouravam bem antes do
+/// download terminar, abortando o lançamento (`SteamLaunchTimeout`) com o
+/// jogo nem chegando a abrir. Subiu pra 10 minutos, mesma generosidade de
+/// `REAPER_GRACE_PERIOD` — mesma assimetria de custo dos outros incidentes
+/// deste arquivo: esperar demais só atrasa por segundos quando o
+/// lançamento falhou de verdade, esperar de menos aborta um download
+/// legítimo no meio.
+const STEAM_APPLAUNCH_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn is_steam_process_running_in(proc_dir: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(proc_dir) else {
@@ -984,13 +1118,14 @@ fn ensure_steam_running_silently_with(
 
 /// Espera a sessão real da Steam pra `app_id` aparecer (jogo realmente
 /// começou a subir sob o Steam Linux Runtime — cobre qualquer checagem/
-/// atualização que a Steam decida fazer antes) e depois desaparecer de vez
-/// (jogo fechou de verdade — com `REAPER_GRACE_PERIOD` de tolerância pra
-/// trocas de `reaper` sequenciais, ver a constante acima). Sem timeout na
-/// segunda metade: nenhum tempo de jogo é "longo demais". `startup_timeout`
-/// existe só pro primeiro lado — se nenhum `reaper` aparecer, algo deu
-/// errado no lançamento (ex.: diálogo de erro da Steam) e não tem o que
-/// esperar.
+/// atualização que a Steam decida fazer antes, inclusive baixar um update
+/// pendente do jogo em si, ver `STEAM_APPLAUNCH_STARTUP_TIMEOUT`) e depois
+/// desaparecer de vez (jogo fechou de verdade — com `REAPER_GRACE_PERIOD` de
+/// tolerância pra trocas de `reaper` sequenciais, ver a constante acima).
+/// Sem timeout na segunda metade: nenhum tempo de jogo é "longo demais".
+/// `startup_timeout` existe só pro primeiro lado — se nenhum `reaper`
+/// aparecer dentro dele, algo deu errado no lançamento (ex.: diálogo de
+/// erro da Steam) e não tem o que esperar.
 fn wait_for_steam_session(app_id: &str, startup_timeout: Duration) -> Result<(), RunError> {
     wait_for_steam_session_with(
         startup_timeout,
@@ -1057,7 +1192,7 @@ pub fn run_via_steam_applaunch(
         "rsync",
         "ssh",
         &LockGuard::default_path(),
-        Duration::from_secs(60),
+        STEAM_APPLAUNCH_STARTUP_TIMEOUT,
         on_progress,
     )
 }
@@ -1093,6 +1228,31 @@ fn run_via_steam_applaunch_with_options(
 
     let session = GameSession::new(source);
 
+    // Incidente real (2026-09-12, Cyberpunk 2077): instalação completa
+    // rastreada só via `install_path_overrides.steam` (sem manifesto local
+    // nem retrato salvo no FeuVault — a Steam nunca chegou a saber desse
+    // jogo) baixa os arquivos certinho acima, mas `-applaunch` sozinho não
+    // basta: sem `appmanifest_<app_id>.acf`, a Steam trata o jogo como "não
+    // instalado" e abre o diálogo da loja pedindo instalação do zero (61GB
+    // de download desnecessário — os arquivos já estão certos no disco).
+    // `vault-sync update` (steamcmd `+app_update ... validate`, credenciais
+    // em cache do próprio cliente Steam, sem senha) já resolve exatamente
+    // isso — só falta rodar antes do `-applaunch` quando o manifesto
+    // realmente está faltando. Best-effort: falha aqui (sem `steam_account`
+    // configurado, steamcmd indisponível, sem rede) nunca cancela a sessão —
+    // só significa que o `-applaunch` mais adiante corre o mesmo risco de
+    // sempre, comportamento idêntico ao pré-existente antes desta checagem.
+    if let Some(full) = full_install_missing_steam_manifest(cfg, app_id, &full_install) {
+        tracing::info!(
+            app_id,
+            local_dir = %full.local_dir.display(),
+            "manifesto da Steam ausente pra uma instalação completa rastreada — validando via steamcmd antes do -applaunch"
+        );
+        if let Err(err) = crate::update::run_update(cfg, app_id) {
+            tracing::warn!(app_id, %err, "steamcmd validate falhou — tentando -applaunch mesmo assim");
+        }
+    }
+
     ensure_steam_running_silently("steam");
     Command::new("steam")
         .arg("-applaunch")
@@ -1114,6 +1274,7 @@ fn run_via_steam_applaunch_with_options(
     // `legendary_installed_json_path` pra fontes `GameSource::HeroicGame`,
     // que nunca ocorrem aqui.
     upload_and_cleanup(
+        cfg,
         &session.source,
         &vault,
         &local_targets,
@@ -1125,6 +1286,55 @@ fn run_via_steam_applaunch_with_options(
     )?;
 
     Ok(session)
+}
+
+/// Baixa a instalação completa (+ compatdata) de `app_id` do servidor pro
+/// SSD local sem lançar nada — par do `run`/`menu-launch` pensado pra
+/// resolver o caso em que a Steam decide sozinha (ex.: botão "Atualizar" na
+/// biblioteca) que precisa reinstalar via CDN da Valve mesmo com o jogo já
+/// pronto no servidor (`vault-sync pull`, ver cli.rs). Reaproveita a mesma
+/// checagem de manifesto ausente que `run_via_steam_applaunch` já fazia
+/// antes do `-applaunch`: sem ela, a Steam trataria a instalação recém-
+/// chegada como "nunca instalada" e ofereceria reinstalar do zero de novo,
+/// anulando o propósito inteiro deste comando. Devolve o diretório local da
+/// instalação completa quando havia uma rastreada (`None` quando só
+/// compatdata se aplica a este `app_id`/launcher).
+pub fn pull_full_install(
+    cfg: &Config,
+    launcher: Launcher,
+    app_id: &str,
+    steam_root: Option<&Path>,
+    mut on_progress: impl FnMut(Stage, ProgressUpdate),
+) -> Result<Option<PathBuf>, RunError> {
+    let ResolvedSession { full_install, .. } = resolve_and_download(
+        cfg,
+        launcher,
+        app_id,
+        steam_root,
+        "rsync",
+        "ssh",
+        &LockGuard::default_path(),
+        &mut on_progress,
+    )?;
+
+    if launcher == Launcher::Steam {
+        if let Some(full) = full_install_missing_steam_manifest(cfg, app_id, &full_install) {
+            tracing::info!(
+                app_id,
+                local_dir = %full.local_dir.display(),
+                "manifesto da Steam ausente pra uma instalação completa rastreada — validando via steamcmd"
+            );
+            if let Err(err) = crate::update::run_update(cfg, app_id) {
+                tracing::warn!(
+                    app_id,
+                    %err,
+                    "steamcmd validate falhou — a Steam pode não reconhecer a instalação até rodar 'vault-sync update' manualmente"
+                );
+            }
+        }
+    }
+
+    Ok(full_install.map(|f| f.local_dir))
 }
 
 fn cleanup_local(targets: &LocalDeletionTargets, keep_manifest: bool) -> Result<(), RunError> {
@@ -2048,6 +2258,88 @@ mod tests {
     }
 
     #[test]
+    fn missing_manifest_with_full_install_tracked_triggers_steamcmd_validate() {
+        let work = test_dir("missing-manifest-triggers-validate");
+        let local_lib = work.join("ssd");
+        let steam_full_root = work.join("steam-full");
+        let remote_installs = work.join("remote-installs");
+        fs::create_dir_all(steam_full_root.join("steamapps")).unwrap();
+        let cfg = cfg_with_full_install_steam(&local_lib, &steam_full_root, &remote_installs);
+        let full = Some(FullInstallTarget {
+            local_dir: steam_full_root
+                .join("steamapps")
+                .join("common")
+                .join("Cyberpunk 2077"),
+            remote_dir: remote_installs.join("steam").join("Cyberpunk 2077"),
+        });
+
+        let result = full_install_missing_steam_manifest(&cfg, "1091500", &full);
+
+        assert_eq!(result, full.as_ref());
+    }
+
+    #[test]
+    fn existing_manifest_never_triggers_steamcmd_validate() {
+        let work = test_dir("existing-manifest-skips-validate");
+        let local_lib = work.join("ssd");
+        let steam_full_root = work.join("steam-full");
+        let remote_installs = work.join("remote-installs");
+        fs::create_dir_all(steam_full_root.join("steamapps")).unwrap();
+        fs::write(
+            steam_full_root
+                .join("steamapps")
+                .join("appmanifest_1091500.acf"),
+            "\"installdir\"\t\t\"Cyberpunk 2077\"\n",
+        )
+        .unwrap();
+        let cfg = cfg_with_full_install_steam(&local_lib, &steam_full_root, &remote_installs);
+        let full = Some(FullInstallTarget {
+            local_dir: steam_full_root
+                .join("steamapps")
+                .join("common")
+                .join("Cyberpunk 2077"),
+            remote_dir: remote_installs.join("steam").join("Cyberpunk 2077"),
+        });
+
+        assert_eq!(
+            full_install_missing_steam_manifest(&cfg, "1091500", &full),
+            None
+        );
+    }
+
+    #[test]
+    fn no_full_install_tracked_never_triggers_steamcmd_validate() {
+        let work = test_dir("no-full-install-skips-validate");
+        let local_lib = work.join("ssd");
+        let steam_full_root = work.join("steam-full");
+        let remote_installs = work.join("remote-installs");
+        fs::create_dir_all(steam_full_root.join("steamapps")).unwrap();
+        let cfg = cfg_with_full_install_steam(&local_lib, &steam_full_root, &remote_installs);
+
+        assert_eq!(
+            full_install_missing_steam_manifest(&cfg, "1091500", &None),
+            None
+        );
+    }
+
+    #[test]
+    fn without_local_game_root_steam_never_triggers_steamcmd_validate() {
+        let work = test_dir("no-local-game-root-skips-validate");
+        let local_lib = work.join("ssd");
+        let remote_installs = work.join("remote-installs");
+        let cfg = base_config(&local_lib);
+        let full = Some(FullInstallTarget {
+            local_dir: work.join("Cyberpunk 2077"),
+            remote_dir: remote_installs.join("steam").join("Cyberpunk 2077"),
+        });
+
+        assert_eq!(
+            full_install_missing_steam_manifest(&cfg, "1091500", &full),
+            None
+        );
+    }
+
+    #[test]
     fn without_full_install_config_manifest_is_deleted_like_before_fase_vii() {
         let work = test_dir("no-full-manifest-deleted");
         let local_lib = work.join("ssd");
@@ -2167,7 +2459,8 @@ mod tests {
         .unwrap();
         // Nenhum appmanifest_730.acf local — é exatamente esse o gap.
 
-        let rsync = always_succeeds_rsync(&work);
+        let rsync_log = work.join("rsync-calls.log");
+        let rsync = logging_rsync(&work, &rsync_log);
         let ssh = ssh_returns_manifest(&work, "Jogo Restaurado");
         let lock_path = work.join("session.lock");
         let remote_installs = work.join("remote-installs");
@@ -2187,16 +2480,29 @@ mod tests {
         );
 
         assert!(result.is_ok(), "esperava sucesso, obteve {result:?}");
+        // `detect_full_install` restaura o manifesto do retrato remoto no
+        // meio do fluxo (é o que permite a sessão nem começar a resolver
+        // `installdir`) — o log de chamadas do rsync mostrando o upload de
+        // volta é a evidência indireta de que isso aconteceu: sem o
+        // restore, não haveria manifesto local nenhum pra `upload_and_cleanup`
+        // reenviar no fim.
+        let log_contents = fs::read_to_string(&rsync_log).unwrap();
+        assert!(
+            log_contents.contains("appmanifest_730.acf") && log_contents.contains("730.acf"),
+            "esperava upload do manifesto restaurado de volta ao FeuVault no log do rsync: {log_contents}"
+        );
+        // Fim do ciclo (Incidente 2026-09-20/21): com o retrato já
+        // reenviado, o manifesto local não fica pra trás apontando pra uma
+        // instalação que `run` acabou de apagar — é exatamente isso que
+        // fazia a Steam tentar reinstalar pela CDN vendo um manifesto
+        // órfão.
         let restored_manifest = steam_full_root
             .join("steamapps")
             .join("appmanifest_730.acf");
         assert!(
-            restored_manifest.exists(),
-            "manifesto deveria ter sido restaurado do servidor"
+            !restored_manifest.exists(),
+            "manifesto deveria ter sido reenviado ao FeuVault e apagado localmente, não deixado pra trás"
         );
-        assert!(fs::read_to_string(restored_manifest)
-            .unwrap()
-            .contains("Jogo Restaurado"));
     }
 
     #[test]
@@ -2236,11 +2542,15 @@ mod tests {
         assert_eq!(library_override, Some(steam_full_root.clone()));
         let target = full_install.expect("esperava um FullInstallTarget vindo do override");
         assert_eq!(target.local_dir, override_dir);
-        assert_eq!(target.remote_dir, remote_installs.join("steam").join("Kenshi"));
+        assert_eq!(
+            target.remote_dir,
+            remote_installs.join("steam").join("Kenshi")
+        );
     }
 
     #[test]
-    fn full_install_official_skips_download_when_already_local_and_keeps_manifest_after_purge() {
+    fn full_install_official_skips_download_when_already_local_and_uploads_then_drops_manifest_after_purge()
+     {
         let work = test_dir("full-official-local");
         let steam_full_root = work.join("steam-full");
         fs::create_dir_all(
@@ -2260,7 +2570,8 @@ mod tests {
             .join("Meu Jogo");
         fs::create_dir_all(&install_dir).unwrap();
 
-        let rsync = always_succeeds_rsync(&work);
+        let rsync_log = work.join("rsync-calls.log");
+        let rsync = logging_rsync(&work, &rsync_log);
         let lock_path = work.join("session.lock");
         let remote_installs = work.join("remote-installs");
         let cfg = cfg_with_full_install_steam(&steam_full_root, &steam_full_root, &remote_installs);
@@ -2283,10 +2594,22 @@ mod tests {
             !install_dir.exists(),
             "instalação completa deve ser apagada após o upload confirmado"
         );
+        // Incidente real (2026-09-20/21, Cyberpunk 2077): manter o
+        // manifesto local sem os arquivos do jogo fazia a Steam achar que a
+        // instalação estava corrompida e tentar reinstalar pela CDN da
+        // Valve. Agora o retrato é reenviado ao FeuVault (evidência: a
+        // chamada de rsync logada abaixo) e só então apagado localmente —
+        // `detect_full_install`/`restore_official_manifest_snapshot` já
+        // sabem trazê-lo de volta na próxima sessão.
+        let log_contents = fs::read_to_string(&rsync_log).unwrap();
         assert!(
-            manifest.exists(),
-            "com instalação completa rastreada, o manifesto NUNCA é apagado — é a única \
-             memória do mapeamento app_id→pasta entre sessões"
+            log_contents.contains("appmanifest_730.acf") && log_contents.contains("730.acf"),
+            "esperava upload do manifesto pro FeuVault antes de apagar: {log_contents}"
+        );
+        assert!(
+            !manifest.exists(),
+            "com o retrato já reenviado ao FeuVault, o manifesto local não deve mais ficar \
+             pra trás apontando pra uma instalação que acabou de ser apagada"
         );
     }
 
