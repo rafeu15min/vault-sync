@@ -1015,8 +1015,14 @@ const STEAM_PROCESS_COMM: &str = "steam";
 /// Tempo de graça pra Steam terminar de inicializar depois que o processo
 /// aparece — só o processo existir não significa que a API/IPC interna já
 /// está pronta pra receber um `-applaunch` (ver `ensure_steam_running_
-/// silently`).
-const STEAM_WARMUP_GRACE: Duration = Duration::from_secs(3);
+/// silently`). Incidente real (2026-10-08, Red Dead Redemption 2): com os
+/// 3s antigos, o `-applaunch` chegou enquanto a Steam ainda carregava
+/// (nenhum `GameAction` no console_log) e se perdeu em silêncio — 10
+/// minutos depois, `SteamLaunchTimeout`. Só é pago num boot frio da Steam
+/// (já rodando, `ensure_steam_running_silently_with` retorna na hora),
+/// então errar pra mais custa segundos uma vez; errar pra menos perde o
+/// lançamento inteiro.
+const STEAM_WARMUP_GRACE: Duration = Duration::from_secs(30);
 /// Tempo máximo de espera pro processo da Steam aparecer num boot frio —
 /// bem mais generoso que o de sessão de jogo (`startup_timeout` de
 /// `wait_for_steam_session`), já que carregar a própria Steam do zero é
