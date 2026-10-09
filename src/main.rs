@@ -94,6 +94,63 @@ fn dispatch_run(
     Ok(())
 }
 
+/// Corpo de `pull`: traz compatdata + instalação completa do servidor pro
+/// SSD local sem lançar nada. Extraído de `Command::Pull` pra ser
+/// reaproveitado por `Command::MenuLaunch --no-run` (opção "Executar"
+/// desmarcada no SUPER+G). `label` só muda o texto das notificações — nome
+/// do jogo vindo do menu, o próprio `app_id` vindo da linha de comando.
+fn dispatch_pull(
+    cfg: &config::Config,
+    launcher: Launcher,
+    app_id: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
+
+    let steam_root = scan::find_steam_root();
+    let sink_title = format!("vault-sync — pull {label}");
+    let mut progress = session_progress::SessionProgress::new(&sink_title, cfg.server_name());
+    let result = session::pull_full_install(
+        cfg,
+        launcher,
+        app_id,
+        steam_root.as_deref(),
+        |stage, update| progress.on_progress(stage, update),
+    );
+    progress.finish();
+
+    let local_dir = match result {
+        Ok(local_dir) => local_dir,
+        Err(err) => {
+            tracing::error!("'pull {app_id}' falhou: {err}");
+            display::notify_result(
+                &sink_title,
+                &format!("Falha ao trazer '{label}' do {}:\n{err}", cfg.server_name()),
+                true,
+            );
+            return Err(err.into());
+        }
+    };
+
+    let report = match local_dir {
+        Some(dir) => format!(
+            "'{label}' pronto em {} — abra a Steam/Heroic normalmente, sem baixar nada de novo.",
+            dir.display()
+        ),
+        None => format!(
+            "'{label}': compatdata sincronizado do {} (sem instalação completa rastreada pra este app_id).",
+            cfg.server_name()
+        ),
+    };
+    println!("[vault-sync] 'pull {app_id}' concluído: {report}");
+    display::notify_result(
+        &format!("vault-sync — pull {label} concluído"),
+        &report,
+        false,
+    );
+    Ok(())
+}
+
 /// Versão só-nome de uma label de item ("`app_id` — Nome" ou, pra títulos
 /// Heroic, o próprio título) pro popup zenity do `ingest` — o app_id
 /// numérico é ruído visual ali (ninguém decora AppID de cabeça), diferente
@@ -256,45 +313,7 @@ fn main() -> anyhow::Result<()> {
                 Launcher::Steam
             };
 
-            remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
-
-            let steam_root = scan::find_steam_root();
-            let sink_title = format!("vault-sync — pull {app_id}");
-            let mut progress = session_progress::SessionProgress::new(&sink_title, cfg.server_name());
-            let result = session::pull_full_install(
-                &cfg,
-                launcher,
-                &app_id,
-                steam_root.as_deref(),
-                |stage, update| progress.on_progress(stage, update),
-            );
-            progress.finish();
-
-            let local_dir = match result {
-                Ok(local_dir) => local_dir,
-                Err(err) => {
-                    tracing::error!("'pull {app_id}' falhou: {err}");
-                    display::notify_result(
-                        &sink_title,
-                        &format!("Falha ao trazer '{app_id}' do {}:\n{err}", cfg.server_name()),
-                        true,
-                    );
-                    return Err(err.into());
-                }
-            };
-
-            let report = match local_dir {
-                Some(dir) => format!(
-                    "'{app_id}' pronto em {} — abra a Steam/Heroic normalmente, sem baixar nada de novo.",
-                    dir.display()
-                ),
-                None => format!(
-                    "'{app_id}': compatdata sincronizado do {} (sem instalação completa rastreada pra este app_id).",
-                    cfg.server_name()
-                ),
-            };
-            println!("[vault-sync] 'pull {app_id}' concluído: {report}");
-            display::notify_result(&format!("vault-sync — pull {app_id} concluído"), &report, false);
+            dispatch_pull(&cfg, launcher, &app_id, &app_id)?;
         }
         Command::Catalog { format } => {
             let cfg = require_config(cfg, "catalog")?;
@@ -335,7 +354,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Command::MenuLaunch { selection } => {
+        Command::MenuLaunch { selection, no_run } => {
             let cfg = require_config(cfg, "menu-launch")?;
             remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
             let catalog = catalog::build_catalog(&cfg)?;
@@ -346,6 +365,29 @@ fn main() -> anyhow::Result<()> {
                         "'{selection}' não está mais no catálogo — rode 'vault-sync catalog' de novo (a lista pode ter mudado)"
                     )
                 })?;
+
+            if no_run {
+                // "Executar" desmarcado no menu: só o download, nada de
+                // Proton/`-applaunch` — por isso nem o non-Steam exige
+                // Proton escolhido aqui. Atalho non-Steam usa o mesmo
+                // app_id/launcher que o `dispatch_run` dele usaria.
+                let launcher = match &entry.source {
+                    domain::GameSource::Official { .. }
+                    | domain::GameSource::NonSteamShortcut { .. } => Launcher::Steam,
+                    domain::GameSource::HeroicGame { .. } => Launcher::Heroic,
+                    domain::GameSource::Orphan { .. } => anyhow::bail!(
+                        "'{}' é órfão (sem manifesto/atalho conhecido) — rode 'vault-sync scan' \
+                         e investigue antes de tentar baixar pelo menu",
+                        entry.display_name
+                    ),
+                };
+                return dispatch_pull(
+                    &cfg,
+                    launcher,
+                    &entry.source.app_id_str(),
+                    &entry.display_name,
+                );
+            }
 
             match &entry.source {
                 domain::GameSource::Official { app_id } => {

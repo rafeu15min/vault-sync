@@ -110,7 +110,14 @@ pub enum Command {
     /// Uso interno de `tools/vault-sync-menu.sh`: recebe de volta a linha
     /// exata que `catalog --format=rofi` gerou e despacha pro `run`
     /// correspondente. Não é pensado pra digitar na mão.
-    MenuLaunch { selection: String },
+    MenuLaunch {
+        selection: String,
+
+        /// Só traz o jogo do servidor pro SSD local (mesmo motor do `pull`),
+        /// sem lançar — a opção "Executar" desmarcada no menu.
+        #[arg(long)]
+        no_run: bool,
+    },
 
     /// Compara a biblioteca local com o servidor e envia a ele os
     /// jogos novos encontrados apenas localmente. (Motor: Fase V)
@@ -372,7 +379,25 @@ mod tests {
         let cli =
             Cli::try_parse_from(["vault-sync", "menu-launch", "[Steam] Portal 2 (local)"]).unwrap();
         match cli.command {
-            Command::MenuLaunch { selection } => assert_eq!(selection, "[Steam] Portal 2 (local)"),
+            Command::MenuLaunch { selection, no_run } => {
+                assert_eq!(selection, "[Steam] Portal 2 (local)");
+                assert!(!no_run);
+            }
+            other => panic!("comando inesperado: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn menu_launch_parses_no_run() {
+        let cli = Cli::try_parse_from([
+            "vault-sync",
+            "menu-launch",
+            "--no-run",
+            "[Steam] Portal 2 (FeuVault)",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::MenuLaunch { no_run, .. } => assert!(no_run),
             other => panic!("comando inesperado: {other:?}"),
         }
     }
