@@ -213,6 +213,10 @@ impl RsyncTransfer {
         let mut args = vec![
             "-a".to_string(),
             "--partial".to_string(),
+            // Sem `-X` o rsync perde o `user.WINEREPARSE`, com que o Wine
+            // guarda os links do Windows (ex.: `EA Desktop`): vira pasta
+            // vazia e o EABackgroundService não sobe.
+            "-X".to_string(),
             // Cria os diretórios intermediários do destino que ainda não
             // existem (ex.: primeiro `ingest` de sempre para um FeuVault
             // recém-provisionado, antes de qualquer `steamapps/compatdata`
@@ -335,6 +339,7 @@ mod tests {
         );
         assert_eq!(args[0], "-a");
         assert!(args.contains(&"--partial".to_string()));
+        assert!(args.contains(&"-X".to_string()));
         assert!(args.contains(&"--info=progress2".to_string()));
         assert_eq!(
             args[args.len() - 2],
