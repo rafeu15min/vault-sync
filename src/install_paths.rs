@@ -186,7 +186,7 @@ fn manifest_numeric_field(content: &str, field: &str) -> Option<u64> {
 /// manifesto da Steam são a fonte mais direta pra detectar isso. Ausência
 /// de qualquer um dos dois campos (manifesto antigo/incomum) não bloqueia
 /// — só quando os dois estão presentes E divergem.
-fn is_download_in_progress(library: &Path, app_id: &str) -> bool {
+pub fn is_download_in_progress(library: &Path, app_id: &str) -> bool {
     let manifest = library
         .join("steamapps")
         .join(format!("appmanifest_{app_id}.acf"));

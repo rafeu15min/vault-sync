@@ -435,6 +435,7 @@ struct ResolvedSession {
     remote_paths: crate::paths::RemotePaths,
     local_targets: LocalDeletionTargets,
     full_install: Option<FullInstallTarget>,
+    library_root: PathBuf,
     // Mantido vivo pelo chamador enquanto a sessão estiver em andamento —
     // liberado automaticamente no Drop.
     _lock: LockGuard,
@@ -646,6 +647,7 @@ fn resolve_and_download(
         remote_paths,
         local_targets,
         full_install,
+        library_root: library.root.clone(),
         _lock,
     })
 }
@@ -677,6 +679,7 @@ fn run_session_with_options(
         remote_paths,
         local_targets,
         full_install,
+        library_root: _,
         _lock,
     } = resolve_and_download(
         cfg,
@@ -1323,19 +1326,39 @@ fn ensure_steam_running_silently_with(
 /// Sem timeout na segunda metade: nenhum tempo de jogo é "longo demais".
 /// `startup_timeout` existe só pro primeiro lado — se nenhum `reaper`
 /// aparecer dentro dele, algo deu errado no lançamento (ex.: diálogo de
-/// erro da Steam) e não tem o que esperar.
-fn wait_for_steam_session(app_id: &str, startup_timeout: Duration) -> Result<(), RunError> {
+/// erro da Steam) e não tem o que esperar. Exceção: com a atualização do
+/// jogo em andamento (`updating`), a janela recomeça a cada vez que estoura,
+/// até `STEAM_UPDATE_WAIT_MAX` — incidente real (2026-10-25, Cyberpunk
+/// 2077): 27 GB de atualização levam bem mais que os 10 minutos, e o
+/// vault-sync desistiu com a Steam ainda baixando.
+fn wait_for_steam_session(
+    app_id: &str,
+    startup_timeout: Duration,
+    library_root: &Path,
+) -> Result<(), RunError> {
     wait_for_steam_session_with(
         startup_timeout,
         REAPER_GRACE_PERIOD,
         REAPER_POLL_INTERVAL,
         || find_reaper_pid(app_id).is_some(),
+        || {
+            let updating = crate::install_paths::is_download_in_progress(library_root, app_id);
+            if updating {
+                tracing::info!(app_id, "a Steam está atualizando o jogo — continuando a esperar");
+            }
+            updating
+        },
     )
     .ok_or_else(|| RunError::SteamLaunchTimeout(app_id.to_string()))
 }
 
-/// Núcleo testável de `wait_for_steam_session`: `reaper_present` injetado
-/// em vez de tocar `/proc` diretamente. `None` só quando nenhuma sessão
+/// Teto da espera por uma atualização do jogo que a Steam baixa antes de
+/// lançá-lo — passando disso, volta a valer o erro de lançamento (o usuário
+/// pode ter pausado a atualização, e esperar pra sempre não ajuda).
+const STEAM_UPDATE_WAIT_MAX: Duration = Duration::from_secs(4 * 3600);
+
+/// Núcleo testável de `wait_for_steam_session`: `reaper_present` e
+/// `updating` injetados em vez de tocar `/proc` e o manifesto diretamente. `None` só quando nenhuma sessão
 /// jamais apareceu dentro de `startup_timeout` — uma vez que apareceu ao
 /// menos uma vez, sempre acaba retornando `Some(())` (só depois que
 /// `reaper_present()` ficar falso por `grace_period` contínuo).
@@ -1344,14 +1367,19 @@ fn wait_for_steam_session_with(
     grace_period: Duration,
     poll_interval: Duration,
     mut reaper_present: impl FnMut() -> bool,
+    mut updating: impl FnMut() -> bool,
 ) -> Option<()> {
-    let deadline = Instant::now() + startup_timeout;
+    let hard_stop = Instant::now() + STEAM_UPDATE_WAIT_MAX;
+    let mut deadline = Instant::now() + startup_timeout;
     loop {
         if reaper_present() {
             break;
         }
         if Instant::now() >= deadline {
-            return None;
+            if Instant::now() >= hard_stop || !updating() {
+                return None;
+            }
+            deadline = Instant::now() + startup_timeout;
         }
         std::thread::sleep(poll_interval);
     }
@@ -1412,6 +1440,7 @@ fn run_via_steam_applaunch_with_options(
         remote_paths,
         local_targets,
         full_install,
+        library_root,
         _lock,
     } = resolve_and_download(
         cfg,
@@ -1466,7 +1495,7 @@ fn run_via_steam_applaunch_with_options(
         },
     );
 
-    wait_for_steam_session(app_id, startup_timeout)?;
+    wait_for_steam_session(app_id, startup_timeout, &library_root)?;
 
     // Sempre Launcher::Steam (hardcoded acima) — `upload_and_cleanup` só usa
     // `legendary_installed_json_path` pra fontes `GameSource::HeroicGame`,
@@ -1743,7 +1772,11 @@ mod tests {
         // caminho de timeout. O caminho de sucesso/carência é testado via
         // `wait_for_steam_session_with` (injetável) logo abaixo.
         let result =
-            wait_for_steam_session("999999999-teste-inexistente", Duration::from_millis(50));
+            wait_for_steam_session(
+                "999999999-teste-inexistente",
+                Duration::from_millis(50),
+                Path::new("/nao/existe"),
+            );
         assert!(matches!(result, Err(RunError::SteamLaunchTimeout(_))));
     }
 
@@ -1773,6 +1806,7 @@ mod tests {
                 i.set((idx + 1).min(sequence.len() - 1));
                 sequence[idx]
             },
+            || false,
         );
         assert_eq!(result, Some(()));
     }
@@ -1784,8 +1818,34 @@ mod tests {
             Duration::from_millis(10),
             Duration::from_millis(5),
             || false,
+            || false,
         );
         assert_eq!(result, None);
+    }
+
+    #[test]
+    fn wait_for_steam_session_with_keeps_waiting_while_steam_updates_the_game() {
+        // Regressão (2026-10-25, Cyberpunk 2077): a Steam baixa a atualização
+        // antes de lançar, sem nenhum `reaper` — estourar `startup_timeout`
+        // no meio do download abortava a sessão. Com `updating` verdadeiro, a
+        // janela recomeça; o `reaper` aparece só depois de várias janelas.
+        let polls = std::cell::Cell::new(0u32);
+        let checks = std::cell::Cell::new(0u32);
+        let result = wait_for_steam_session_with(
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+            || {
+                polls.set(polls.get() + 1);
+                checks.get() >= 3 && polls.get() < 400 // aparece e some
+            },
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() <= 3
+            },
+        );
+        assert_eq!(result, Some(()));
+        assert!(checks.get() >= 3, "a janela deveria ter recomeçado 3 vezes");
     }
 
     /// Fabrica `<fake_proc>/<pid>/{comm,environ}` — `environ` no formato
