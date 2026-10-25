@@ -612,6 +612,28 @@ fn epic_manifest_only_entries(
         .collect()
 }
 
+/// `true` (e avisa no log) quando algum processo ainda usa o prefixo Wine de
+/// `compatdata_dir` (jogo, EA app ou wineserver ainda abertos): o item fica
+/// todo de fora desta rodada — enviar agora gravaria no servidor um retrato
+/// com registro e arquivos fora de sincronia, e `--and-purge-local`
+/// apagaria um prefixo em uso (ver `session::PREFIX_QUIET_TIMEOUT`). Sem
+/// esperar como o fim de sessão espera: o `ingest` do desligamento tem só
+/// 120s (`systemd/vault-sync-flush.service`). Varre `/proc` a cada item, de
+/// propósito: conta o estado na hora do envio, não no início de um `ingest`
+/// longo (itens × processos, as duas listas na casa das centenas).
+fn prefix_in_use(compatdata_dir: &Path, label: &str) -> bool {
+    let users = crate::session::prefix_users(compatdata_dir);
+    if users.is_empty() {
+        return false;
+    }
+    tracing::warn!(
+        "'{label}' pulado: o prefixo Wine ainda está em uso por {} — nada enviado nem apagado; \
+         rode o ingest de novo depois de fechar esses processos",
+        crate::session::describe_processes(&users)
+    );
+    true
+}
+
 /// Apaga o compatdata (+ manifesto, se presente) local de `targets`, só
 /// depois de um upload já confirmado — mesma operação que `purge.rs` faz,
 /// reaproveitada aqui pro `--and-purge-local` do `ingest`.
@@ -915,6 +937,9 @@ fn run_steam_compatdata_pass(
             };
             let local_targets = library.deletion_targets(&source)?;
             let remote_paths = vault.paths_for(&source)?;
+            if prefix_in_use(&local_targets.compatdata_dir, &label) {
+                continue;
+            }
 
             on_uploading(&label);
             RsyncTransfer::incremental_upload(
@@ -1444,6 +1469,9 @@ fn run_epic_pass(
             };
             let local_targets = library.deletion_targets(&source)?;
             let remote_paths = heroic_vault.paths_for(&source)?;
+            if prefix_in_use(&local_targets.compatdata_dir, &title) {
+                continue;
+            }
 
             on_uploading(&title);
             RsyncTransfer::incremental_upload(
@@ -1910,6 +1938,46 @@ mod tests {
         assert_eq!(summary.uploaded, 1);
         assert_eq!(summary.purged_local, 1);
         assert!(!compatdata.exists());
+    }
+
+    #[test]
+    fn prefix_still_in_use_is_neither_uploaded_nor_purged() {
+        // Jogo ou EA app ainda abertos no prefixo — modelado por um processo
+        // de verdade com `WINEPREFIX` apontando pra ele.
+        let dir = test_dir("prefix-in-use");
+        let local_lib = dir.join("ssd");
+        let compatdata = local_lib.join("steamapps").join("compatdata").join("200");
+        fs::create_dir_all(compatdata.join("pfx")).unwrap();
+
+        let ssh = fake_bin(&dir, "fake-ssh.sh", "printf ''");
+        let rsync = fake_bin(&dir, "fake-rsync.sh", "exit 0");
+        let mut lingering = std::process::Command::new("sleep")
+            .arg("30")
+            .env("WINEPREFIX", compatdata.join("pfx"))
+            .spawn()
+            .unwrap();
+
+        let mut uploading = Vec::new();
+        let result = run_ingest_with_options(
+            &cfg_with_lib(&local_lib),
+            false,
+            true,
+            None,
+            None,
+            rsync.to_str().unwrap(),
+            ssh.to_str().unwrap(),
+            |label: &str| uploading.push(label.to_string()),
+            |_, _, _| {},
+            |_| {},
+        );
+        lingering.kill().ok();
+        lingering.wait().ok();
+
+        let summary = result.unwrap();
+        assert!(uploading.is_empty(), "nada pode ser enviado: {uploading:?}");
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.purged_local, 0);
+        assert!(compatdata.exists(), "prefixo em uso nunca é apagado");
     }
 
     #[test]

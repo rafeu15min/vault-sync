@@ -1,8 +1,9 @@
 use crate::progress::{spawn_progress_reader, ProgressUpdate};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Cifra fixa exigida pela especificação: acelerável via AES-NI, para
 /// saturar o enlace Direct Attach de 2.5 Gbps sem gargalo criptográfico.
@@ -46,6 +47,11 @@ pub enum TransferError {
     NonZeroExit(i32, String),
     #[error("rsync foi encerrado por sinal — enlace provavelmente caiu")]
     KilledBySignal,
+    #[error(
+        "sem um diretório seguro (absoluto e fora de '{0}') pra guardar o que o download \
+         sobrescreveria — download cancelado pra não substituir nada local sem cópia"
+    )]
+    NoBackupDir(String),
 }
 
 impl TransferError {
@@ -89,6 +95,38 @@ pub struct RsyncTransfer {
     local_path: PathBuf,
     remote_path: PathBuf,
     rsync_bin: String,
+    /// Só `FullDownload`: onde o rsync guarda (`--backup --backup-dir`) cada
+    /// arquivo local que o download substituir. `None` num download significa
+    /// "não deu pra garantir um lugar seguro" e faz `execute_with_progress`
+    /// recusar a transferência (ver `backup_dir_for`).
+    backup_dir: Option<PathBuf>,
+}
+
+/// Onde o download guarda o que sobrescreveu, sob `root`
+/// (`~/.local/state/vault-sync/overwritten` em produção): um diretório por
+/// transferência, `<nome do destino>-<segundos unix>`. O rsync só o cria se
+/// de fato tirar algo do caminho, então o normal (destino vazio, cópia local
+/// apagada no fim da sessão anterior) não deixa rastro nenhum.
+///
+/// Risco achado investigando o prefixo quebrado do The Sims 4 (2026-10-23):
+/// o `-a` sem `--backup` substituía qualquer arquivo local diferente do
+/// servidor — inclusive um save ou `system.reg` local MAIS NOVO que sobrou de
+/// uma sessão que não terminou de sincronizar — sem deixar cópia, e saves não
+/// têm como ser recuperados depois. Precisa ser absoluto (relativo,
+/// o rsync resolveria a partir do destino) e fora do destino (dentro, o
+/// backup subiria pro servidor no próximo envio e seria apagado na limpeza
+/// junto com o prefixo). `None` quando não dá pra garantir as duas coisas.
+fn backup_dir_for(root: Option<PathBuf>, local_path: &Path, stamp: u64) -> Option<PathBuf> {
+    let name = local_path.file_name()?.to_string_lossy();
+    let dir = root?.join(format!("{name}-{stamp}"));
+    (dir.is_absolute() && !dir.starts_with(local_path)).then_some(dir)
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 impl RsyncTransfer {
@@ -97,11 +135,14 @@ impl RsyncTransfer {
         remote_path: impl Into<PathBuf>,
         local_path: impl Into<PathBuf>,
     ) -> Self {
+        let local_path = local_path.into();
+        let backup_root = dirs::state_dir().map(|d| d.join("vault-sync").join("overwritten"));
         Self {
             kind: TransferKind::FullDownload,
             ssh_target: ssh_target.into(),
             remote_path: remote_path.into(),
-            local_path: local_path.into(),
+            backup_dir: backup_dir_for(backup_root, &local_path, unix_now()),
+            local_path,
             rsync_bin: "rsync".to_string(),
         }
     }
@@ -117,6 +158,7 @@ impl RsyncTransfer {
             remote_path: remote_path.into(),
             local_path: local_path.into(),
             rsync_bin: "rsync".to_string(),
+            backup_dir: None,
         }
     }
 
@@ -131,6 +173,7 @@ impl RsyncTransfer {
             remote_path: remote_path.into(),
             local_path: local_path.into(),
             rsync_bin: "rsync".to_string(),
+            backup_dir: None,
         }
     }
 
@@ -167,7 +210,7 @@ impl RsyncTransfer {
             }
         };
 
-        vec![
+        let mut args = vec![
             "-a".to_string(),
             "--partial".to_string(),
             // Cria os diretórios intermediários do destino que ainda não
@@ -179,9 +222,34 @@ impl RsyncTransfer {
             "--info=progress2".to_string(),
             "-e".to_string(),
             format!("ssh -c {SSH_CIPHER} {SSH_TRANSPORT_OPTIONS}"),
-            source,
-            destination,
-        ]
+        ];
+        // Mecanismo nativo do rsync, sem cópia nossa: cada arquivo local
+        // que o download substituiria vai antes pra `backup_dir`, no mesmo
+        // caminho relativo (ver `backup_dir_for`).
+        if let Some(dir) = &self.backup_dir {
+            args.push("--backup".to_string());
+            args.push(format!("--backup-dir={}", dir.display()));
+        }
+        args.push(source);
+        args.push(destination);
+        args
+    }
+
+    /// O rsync só cria `backup_dir` quando de fato tirou algo do caminho —
+    /// se ele existe, havia arquivo local diferente do servidor (talvez um
+    /// save mais novo) e quem usa precisa saber onde ficou. Roda também
+    /// quando o download falha no meio: o que já foi guardado continua lá.
+    fn warn_if_anything_was_overwritten(&self) {
+        let Some(dir) = self.backup_dir.as_ref().filter(|d| d.exists()) else {
+            return;
+        };
+        tracing::warn!(
+            "o download substituiu arquivos locais diferentes do servidor em '{}' — as versões \
+             locais antigas foram guardadas em '{}' (confira antes de apagar: podem ser saves \
+             mais novos que a cópia do servidor)",
+            self.local_path.display(),
+            dir.display()
+        );
     }
 
     fn to_command(&self) -> Command {
@@ -199,6 +267,11 @@ impl RsyncTransfer {
         &self,
         mut on_progress: impl FnMut(ProgressUpdate),
     ) -> Result<(), TransferError> {
+        if self.kind == TransferKind::FullDownload && self.backup_dir.is_none() {
+            return Err(TransferError::NoBackupDir(
+                self.local_path.display().to_string(),
+            ));
+        }
         let mut child = self
             .to_command()
             .stdout(Stdio::piped())
@@ -233,6 +306,7 @@ impl RsyncTransfer {
 
         let status = child.wait().map_err(TransferError::Spawn)?;
         let stderr_text = stderr_handle.join().unwrap_or_default();
+        self.warn_if_anything_was_overwritten();
         match status.code() {
             Some(0) => Ok(()),
             Some(code) => Err(TransferError::NonZeroExit(code, stderr_text)),
@@ -318,6 +392,82 @@ mod tests {
     fn always_creates_missing_intermediate_destination_directories() {
         let t = RsyncTransfer::full_download("feuvault", "/vault/x", "/ssd/x");
         assert!(t.build_args().contains(&"--mkpath".to_string()));
+    }
+
+    #[test]
+    fn full_download_backs_up_what_it_overwrites_outside_the_destination() {
+        let dest = "/ssd/steamapps/compatdata/1222670";
+        let t =
+            RsyncTransfer::full_download("feuvault", "/vault/steamapps/compatdata/1222670", dest);
+        let args = t.build_args();
+
+        assert!(args.contains(&"--backup".to_string()));
+        let backup_dir = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--backup-dir="))
+            .map(Path::new)
+            .expect("download sem --backup-dir");
+        assert!(
+            backup_dir.is_absolute(),
+            "relativo cairia dentro do destino"
+        );
+        assert!(!backup_dir.starts_with(dest));
+        assert!(backup_dir
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("1222670-"));
+        // Opções sempre antes da origem/destino.
+        assert_eq!(args[args.len() - 1], dest);
+    }
+
+    #[test]
+    fn uploads_never_ask_rsync_for_backups() {
+        let uploads = [
+            RsyncTransfer::incremental_upload("feuvault", "/ssd/x", "/vault/x"),
+            RsyncTransfer::upload_single_file("feuvault", "/ssd/x.acf", "/vault/x.acf"),
+        ];
+        for t in uploads {
+            assert!(!t.build_args().iter().any(|a| a.starts_with("--backup")));
+        }
+    }
+
+    #[test]
+    fn backup_dir_for_only_accepts_an_absolute_dir_outside_the_destination() {
+        let root = || Some(PathBuf::from("/home/u/.local/state/vault-sync/overwritten"));
+        assert_eq!(
+            backup_dir_for(root(), Path::new("/ssd/compatdata/730"), 42),
+            Some(PathBuf::from(
+                "/home/u/.local/state/vault-sync/overwritten/730-42"
+            ))
+        );
+        // Destino que contém a raiz do backup (ex.: $HOME inteiro).
+        assert_eq!(backup_dir_for(root(), Path::new("/home/u"), 42), None);
+        assert_eq!(
+            backup_dir_for(Some(PathBuf::from("relativo")), Path::new("/ssd/730"), 42),
+            None
+        );
+        assert_eq!(backup_dir_for(None, Path::new("/ssd/730"), 42), None);
+        assert_eq!(backup_dir_for(root(), Path::new("/"), 42), None);
+    }
+
+    #[test]
+    fn download_without_a_safe_backup_dir_is_refused_before_rsync_runs() {
+        let dir = crate::testutil::test_dir("rsync", "no-backup-dir");
+        let marker = dir.join("rsync-ran");
+        let script = crate::testutil::write_script(
+            &dir,
+            "fake-rsync.sh",
+            &format!("touch '{}'", marker.display()),
+        );
+        let mut t = RsyncTransfer::full_download("feuvault", "/vault/x", "/ssd/x");
+        t.rsync_bin = script.display().to_string();
+        t.backup_dir = None;
+
+        let result = t.execute_with_progress(|_| {});
+
+        assert!(matches!(result, Err(TransferError::NoBackupDir(_))));
+        assert!(!marker.exists(), "o rsync não deveria nem ter sido chamado");
     }
 
     fn fake_script(body: &str) -> PathBuf {

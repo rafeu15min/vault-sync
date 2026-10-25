@@ -65,6 +65,7 @@ O `vault-sync` lê/grava três arquivos, todos sob
 | `config.json` | você (ou `set-proton`/`set-server-name`/`set-client-name`) | Configuração principal — caminhos locais/remotos e preferências. Ver campos abaixo. |
 | `remote_catalog_cache.json` | só o `vault-sync` (automático) | Última listagem remota bem-sucedida, gravada por `run_list`/`ingest`/`catalog` — permite o catálogo (menu SUPER+G) continuar mostrando jogos remotos com o servidor desligado. Nunca edite na mão; apagar é seguro (só perde o cache, refaz sozinho na próxima listagem). |
 | `~/.local/state/vault-sync/vault-sync.log` (`$XDG_STATE_HOME`, fora de `~/.config`) | só o `vault-sync` (automático) | Log persistente (append), espelha o que sai no terminal — útil pra investigar uma sessão depois de fechada. |
+| `~/.local/state/vault-sync/overwritten/<nome>-<segundos unix>/` | só o `vault-sync` (automático) | Versão local antiga de cada arquivo que um download do servidor substituiu (`rsync --backup`), no mesmo caminho relativo. Só aparece quando havia arquivo local diferente do servidor (ex.: sobra de uma sessão que não terminou de enviar) — o log avisa o caminho. Nada aqui é apagado sozinho: confira (podem ser saves mais novos) e apague à mão. |
 
 ### `config.json`
 

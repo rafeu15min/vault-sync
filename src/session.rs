@@ -6,6 +6,9 @@ use crate::paths::{LocalDeletionTargets, PathSafetyError, RemoteVault};
 use crate::progress::ProgressUpdate;
 use crate::rsync::{RsyncTransfer, TransferError};
 use crate::scan;
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -73,6 +76,18 @@ pub enum RunError {
          manualmente num terminal pra ver a mensagem de erro real"
     )]
     GameExitedImmediately { status: String, elapsed_secs: u64 },
+    #[error(
+        "o prefixo Wine de '{app_id}' ({dir}) continuava em uso depois de {timeout_secs}s por: \
+         {processes} — {outcome}. Feche esses processos (ex.: EA app ou outro launcher ainda \
+         aberto em segundo plano) e depois envie com 'vault-sync ingest --only \"{app_id}\"'"
+    )]
+    PrefixStillActive {
+        app_id: String,
+        dir: String,
+        timeout_secs: u64,
+        processes: String,
+        outcome: &'static str,
+    },
 }
 
 /// Ciclo de vida completo de uma sessão (3.1 → 3.4): aquisição integral,
@@ -778,6 +793,7 @@ fn run_session_with_options(
         &full_install,
         rsync_bin,
         legendary_installed_json_path,
+        PREFIX_QUIET_TIMEOUT,
         &mut on_progress,
     )?;
 
@@ -824,8 +840,19 @@ fn upload_and_cleanup(
     full_install: &Option<FullInstallTarget>,
     rsync_bin: &str,
     legendary_installed_json_path: Option<&Path>,
+    prefix_quiet_timeout: Duration,
     mut on_progress: impl FnMut(Stage, ProgressUpdate),
 ) -> Result<(), RunError> {
+    // O jogo fechou, mas o prefixo pode continuar vivo (serviços do EA app,
+    // wineserver ainda gravando o registro) — ver `PREFIX_QUIET_TIMEOUT`.
+    let app_id = source.app_id_str();
+    wait_for_prefix_quiet(
+        &app_id,
+        &local_targets.compatdata_dir,
+        prefix_quiet_timeout,
+        "nada foi enviado ao servidor nem apagado localmente",
+    )?;
+
     // Incidente real (2026-09-07, "Nobody Wants to Die", segundo capítulo):
     // depois de corrigir o lado do download, o mesmo erro apareceu no
     // upload — o jogo abriu mas crashou antes de escrever qualquer coisa
@@ -881,6 +908,15 @@ fn upload_and_cleanup(
         }
         _ => true,
     };
+    // Segunda checagem, logo antes de apagar: algo pode ter voltado a usar
+    // o prefixo durante o envio (ex.: "Jogar" clicado direto na Steam, fora
+    // do vault-sync). Normalmente volta na hora.
+    wait_for_prefix_quiet(
+        &app_id,
+        &local_targets.compatdata_dir,
+        prefix_quiet_timeout,
+        "o envio ao servidor terminou, mas a cópia local NÃO foi apagada",
+    )?;
     cleanup_local(local_targets, full_install.is_some() && !manifest_safe_to_drop)?;
     if let Some(full) = full_install {
         if full.local_dir.exists() {
@@ -967,6 +1003,162 @@ fn find_reaper_pid_in(proc_dir: &str, app_id: &str) -> Option<u32> {
 /// testável sem tocar em `/proc` de verdade.
 fn cmdline_has_marker(cmdline: &str, marker: &str) -> bool {
     cmdline.split('\0').any(|arg| arg == marker)
+}
+
+/// Quanto o fim de sessão espera o prefixo Wine do jogo ficar quieto
+/// (nenhum processo com `WINEPREFIX` apontando pra ele) antes de enviar ao
+/// servidor e apagar a cópia local. O registro do Wine (`system.reg`,
+/// `user.reg`) é gravado pelo wineserver, que só encerra — e grava a última
+/// versão — depois que o último processo do prefixo sai; o EA app deixa
+/// serviços próprios (EABackgroundService, EADesktop, EALocalHostSvc)
+/// rodando no prefixo depois que o jogo fecha. Hipótese ainda não provada
+/// da investigação do The Sims 4 (2026-10-23, segundo download já veio com
+/// o prefixo quebrado): enviar/apagar com o prefixo ainda ativo grava no
+/// servidor um retrato com registro e arquivos fora de sincronia — e apaga
+/// a cópia local a partir dele. Estourar o tempo nunca apaga nada (ver
+/// `RunError::PrefixStillActive`); por isso pode ser generoso.
+const PREFIX_QUIET_TIMEOUT: Duration = Duration::from_secs(180);
+const PREFIX_QUIET_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PREFIX_QUIET_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Identidade (dispositivo, inode) de um diretório — o mesmo critério que o
+/// próprio wineserver usa pra decidir qual servidor atende qual prefixo.
+/// Casa o mesmo diretório escrito de jeitos diferentes (barra final que o
+/// Proton põe, `~/.steam/steam` vs. `~/.local/share/Steam`, biblioteca por
+/// symlink), coisa que comparar o texto do caminho não faria.
+fn dir_identity(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// Identidade do `WINEPREFIX` de um processo (`proc_entry` = `/proc/<pid>`).
+/// Todo processo Wine precisa dessa variável pra achar o próprio wineserver
+/// — inclusive o wineserver em si, que a herda do primeiro cliente.
+/// Resolve primeiro pela raiz do próprio processo (`/proc/<pid>/root`), que
+/// enxerga o caminho do jeito que o contêiner da Steam Linux Runtime
+/// enxerga; sem acesso a ela, cai pro caminho visto do host.
+fn wineprefix_identity(proc_entry: &Path) -> Option<(u64, u64)> {
+    let environ = std::fs::read(proc_entry.join("environ")).ok()?;
+    let value = environ
+        .split(|&b| b == 0)
+        .find_map(|var| var.strip_prefix(b"WINEPREFIX="))?;
+    let prefix = Path::new(OsStr::from_bytes(value));
+    let seen_by_process = proc_entry
+        .join("root")
+        .join(prefix.strip_prefix("/").unwrap_or(prefix));
+    dir_identity(&seen_by_process).or_else(|| dir_identity(prefix))
+}
+
+fn process_name(proc_entry: &Path) -> String {
+    std::fs::read_to_string(proc_entry.join("comm"))
+        .map(|c| c.trim().to_string())
+        .unwrap_or_default()
+}
+
+/// `(pid, nome)` de cada processo em `proc_dir` usando `compatdata_dir`
+/// como prefixo Wine: o Proton aponta `WINEPREFIX` pra `<compatdata>/pfx`, o
+/// Wine puro (Heroic sem Proton) pro próprio diretório. Vazio quando
+/// `compatdata_dir` nem existe — não há cópia local pra proteger. O próprio
+/// vault-sync fica de fora: se alguém o lançar com `WINEPREFIX` no
+/// ambiente, ele esperaria por si mesmo até o tempo acabar.
+fn prefix_users_in(proc_dir: &Path, compatdata_dir: &Path) -> Vec<(u32, String)> {
+    let targets: Vec<(u64, u64)> = [compatdata_dir.join("pfx"), compatdata_dir.to_path_buf()]
+        .iter()
+        .filter_map(|p| dir_identity(p))
+        .collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(proc_dir) else {
+        return Vec::new();
+    };
+    let own_pid = std::process::id();
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            Some((
+                entry.file_name().to_str()?.parse::<u32>().ok()?,
+                entry.path(),
+            ))
+        })
+        .filter(|(pid, _)| *pid != own_pid)
+        // `targets` tem no máximo 2 itens: o `contains` não vira custo quadrático.
+        .filter(|(_, path)| wineprefix_identity(path).is_some_and(|id| targets.contains(&id)))
+        .map(|(pid, path)| (pid, process_name(&path)))
+        .collect()
+}
+
+/// Processos usando agora o prefixo Wine de `compatdata_dir` — também usado
+/// por `ingest` pra não enviar/apagar um prefixo vivo.
+pub(crate) fn prefix_users(compatdata_dir: &Path) -> Vec<(u32, String)> {
+    prefix_users_in(Path::new("/proc"), compatdata_dir)
+}
+
+pub(crate) fn describe_processes(users: &[(u32, String)]) -> String {
+    users
+        .iter()
+        .map(|(pid, name)| format!("{name} (pid {pid})"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Espera o prefixo de `compatdata_dir` ficar sem nenhum processo, até
+/// `timeout`. Estourou: `RunError::PrefixStillActive`, com `outcome`
+/// dizendo o que já tinha acontecido (quem chama nunca apaga nada depois
+/// de um erro aqui).
+fn wait_for_prefix_quiet(
+    app_id: &str,
+    compatdata_dir: &Path,
+    timeout: Duration,
+    outcome: &'static str,
+) -> Result<(), RunError> {
+    wait_for_prefix_quiet_with(
+        timeout,
+        PREFIX_QUIET_POLL_INTERVAL,
+        PREFIX_QUIET_LOG_INTERVAL,
+        || prefix_users(compatdata_dir),
+    )
+    .map_err(|busy| RunError::PrefixStillActive {
+        app_id: app_id.to_string(),
+        dir: compatdata_dir.display().to_string(),
+        timeout_secs: timeout.as_secs(),
+        processes: describe_processes(&busy),
+        outcome,
+    })
+}
+
+/// Núcleo testável de `wait_for_prefix_quiet`: `users` injetado em vez de
+/// varrer `/proc`. `Err` traz quem ainda usava o prefixo quando o tempo
+/// acabou; o progresso vai pro log a cada `log_interval` (a primeira vez
+/// logo na primeira checagem ocupada).
+fn wait_for_prefix_quiet_with(
+    timeout: Duration,
+    poll_interval: Duration,
+    log_interval: Duration,
+    mut users: impl FnMut() -> Vec<(u32, String)>,
+) -> Result<(), Vec<(u32, String)>> {
+    let started = Instant::now();
+    let mut next_log = started;
+    loop {
+        let busy = users();
+        if busy.is_empty() {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(busy);
+        }
+        if Instant::now() >= next_log {
+            tracing::info!(
+                "prefixo Wine ainda em uso por {} — esperando ficar quieto antes de enviar e \
+                 limpar ({}s de no máximo {}s)",
+                describe_processes(&busy),
+                started.elapsed().as_secs(),
+                timeout.as_secs()
+            );
+            next_log += log_interval;
+        }
+        std::thread::sleep(poll_interval);
+    }
 }
 
 /// Margem de segurança entre um `reaper` sumir e considerar a sessão
@@ -1288,6 +1480,7 @@ fn run_via_steam_applaunch_with_options(
         &full_install,
         rsync_bin,
         None,
+        PREFIX_QUIET_TIMEOUT,
         &mut on_progress,
     )?;
 
@@ -1595,30 +1788,237 @@ mod tests {
         assert_eq!(result, None);
     }
 
-    /// rsync que só falha quando invocado como upload (origem local, sem
-    /// ':'). `build_args` sempre produz exatamente 8 argumentos
-    /// (`-a --partial --mkpath --info=progress2 -e "ssh -c ..." <source>
-    /// <dest>`), então `$7` é sempre a origem.
+    /// Fabrica `<fake_proc>/<pid>/{comm,environ}` — `environ` no formato
+    /// real de `/proc` (variáveis separadas por byte nulo).
+    fn fake_proc_env(proc_dir: &Path, pid: u32, comm: &str, env: &[&str]) {
+        let entry_dir = proc_dir.join(pid.to_string());
+        fs::create_dir_all(&entry_dir).unwrap();
+        fs::write(entry_dir.join("comm"), format!("{comm}\n")).unwrap();
+        fs::write(entry_dir.join("environ"), env.join("\0")).unwrap();
+    }
+
+    #[test]
+    fn prefix_users_in_finds_every_process_whose_wineprefix_is_this_prefix() {
+        let work = test_dir("prefix-users");
+        let compatdata = work.join("compatdata").join("1222670");
+        let pfx = compatdata.join("pfx");
+        let other_pfx = work.join("compatdata").join("730").join("pfx");
+        fs::create_dir_all(&pfx).unwrap();
+        fs::create_dir_all(&other_pfx).unwrap();
+        // Mesma biblioteca vista por outro caminho, como `~/.steam/steam`.
+        let alias = work.join("alias");
+        std::os::unix::fs::symlink(&compatdata, &alias).unwrap();
+
+        let proc_dir = work.join("proc");
+        // Barra final: é assim que o Proton monta o `WINEPREFIX`.
+        let with_slash = format!("WINEPREFIX={}/", pfx.display());
+        let via_alias = format!("WINEPREFIX={}", alias.join("pfx").display());
+        let other = format!("WINEPREFIX={}", other_pfx.display());
+        let steam_only = format!("STEAM_COMPAT_DATA_PATH={}", compatdata.display());
+        fake_proc_env(&proc_dir, 100, "wineserver", &[&with_slash]);
+        fake_proc_env(
+            &proc_dir,
+            101,
+            "EADesktop.exe",
+            &["HOME=/home/u", &via_alias],
+        );
+        fake_proc_env(&proc_dir, 102, "outro-jogo.exe", &[&other]);
+        fake_proc_env(&proc_dir, 103, "bash", &["HOME=/home/u"]);
+        // Script `proton`/`reaper`: só o ambiente da Steam, sem
+        // `WINEPREFIX` — esses o `reaper`/`child.wait()` já acompanham.
+        fake_proc_env(&proc_dir, 104, "python3", &[&steam_only]);
+        fs::create_dir_all(proc_dir.join("self")).unwrap();
+
+        let mut users = prefix_users_in(&proc_dir, &compatdata);
+        users.sort();
+        assert_eq!(
+            users,
+            vec![
+                (100, "wineserver".to_string()),
+                (101, "EADesktop.exe".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_users_in_matches_a_plain_wine_prefix_and_ignores_a_missing_one() {
+        // Heroic sem Proton: o `WINEPREFIX` é a própria pasta do título.
+        let work = test_dir("prefix-users-plain-wine");
+        let prefix = work.join("Prefixes").join("default").join("Jogo");
+        fs::create_dir_all(&prefix).unwrap();
+        let proc_dir = work.join("proc");
+        let env = format!("WINEPREFIX={}", prefix.display());
+        fake_proc_env(&proc_dir, 200, "Jogo.exe", &[&env]);
+
+        assert_eq!(
+            prefix_users_in(&proc_dir, &prefix),
+            vec![(200, "Jogo.exe".to_string())]
+        );
+        assert!(prefix_users_in(&proc_dir, &work.join("nao-existe")).is_empty());
+    }
+
+    #[test]
+    fn prefix_users_in_resolves_wineprefix_from_inside_the_process_root() {
+        // Processo num contêiner (Steam Linux Runtime) que monta o prefixo
+        // num caminho que nem existe no host: só `/proc/<pid>/root` resolve.
+        let work = test_dir("prefix-users-container");
+        let compatdata = work.join("compatdata").join("1222670");
+        fs::create_dir_all(compatdata.join("pfx")).unwrap();
+        let container_root = work.join("container-root");
+        fs::create_dir_all(container_root.join("run")).unwrap();
+        std::os::unix::fs::symlink(
+            compatdata.join("pfx"),
+            container_root.join("run").join("vault-sync-teste-pfx"),
+        )
+        .unwrap();
+
+        let proc_dir = work.join("proc");
+        fake_proc_env(
+            &proc_dir,
+            300,
+            "wineserver",
+            &["WINEPREFIX=/run/vault-sync-teste-pfx"],
+        );
+        std::os::unix::fs::symlink(&container_root, proc_dir.join("300").join("root")).unwrap();
+
+        assert_eq!(
+            prefix_users_in(&proc_dir, &compatdata),
+            vec![(300, "wineserver".to_string())]
+        );
+    }
+
+    #[test]
+    fn wait_for_prefix_quiet_with_returns_at_once_when_nothing_uses_the_prefix() {
+        let mut calls = 0;
+        let result = wait_for_prefix_quiet_with(
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            || {
+                calls += 1;
+                Vec::new()
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn wait_for_prefix_quiet_with_waits_for_lingering_processes_to_exit() {
+        // Jogo já fechou; serviço do EA app e wineserver saem devagar.
+        let mut checks = vec![
+            vec![
+                (1, "EADesktop.exe".to_string()),
+                (2, "wineserver".to_string()),
+            ],
+            vec![(2, "wineserver".to_string())],
+            vec![],
+        ]
+        .into_iter();
+        let result = wait_for_prefix_quiet_with(
+            Duration::from_secs(60),
+            Duration::from_millis(1),
+            Duration::from_secs(30),
+            || checks.next().unwrap_or_default(),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(checks.next().is_none(), "deveria ter feito as 3 checagens");
+    }
+
+    #[test]
+    fn wait_for_prefix_quiet_with_gives_up_after_the_timeout_and_says_who_is_left() {
+        let result = wait_for_prefix_quiet_with(
+            Duration::from_millis(30),
+            Duration::from_millis(5),
+            Duration::from_secs(30),
+            || vec![(42, "EABackgroundSe".to_string())],
+        );
+        assert_eq!(result, Err(vec![(42, "EABackgroundSe".to_string())]));
+    }
+
+    #[test]
+    fn active_prefix_at_session_end_is_never_uploaded_nor_deleted() {
+        // Serviço do EA app ainda vivo depois do jogo fechar — modelado por
+        // um processo de verdade com `WINEPREFIX` apontando pro prefixo.
+        let work = test_dir("prefix-still-active");
+        let local_lib = work.join("ssd");
+        let pfx = local_lib
+            .join("steamapps")
+            .join("compatdata")
+            .join("1222670")
+            .join("pfx");
+        fs::create_dir_all(&pfx).unwrap();
+        fs::write(pfx.join("user.reg"), b"registro").unwrap();
+        let rsync_log = work.join("rsync.log");
+        let rsync = logging_rsync(&work, &rsync_log);
+        let mut lingering = Command::new("sleep")
+            .arg("30")
+            .env("WINEPREFIX", &pfx)
+            .spawn()
+            .unwrap();
+
+        let cfg = base_config(&local_lib);
+        let source = GameSource::Official { app_id: 1222670 };
+        let vault = RemoteVault {
+            ssh_target: cfg.remote_ssh_target.clone(),
+            base_path: cfg.remote_base_path.clone(),
+        };
+        let result = upload_and_cleanup(
+            &cfg,
+            &source,
+            &vault,
+            &LibraryLocation::new(local_lib.clone())
+                .deletion_targets(&source)
+                .unwrap(),
+            &vault.paths_for(&source).unwrap(),
+            &None,
+            rsync.to_str().unwrap(),
+            None,
+            Duration::ZERO,
+            |_, _| {},
+        );
+        lingering.kill().ok();
+        lingering.wait().ok();
+
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, RunError::PrefixStillActive { .. }),
+            "esperava PrefixStillActive, obteve {err:?}"
+        );
+        assert!(err.to_string().contains("ingest --only \"1222670\""));
+        assert!(
+            !rsync_log.exists(),
+            "nada pode ser enviado com o prefixo ativo"
+        );
+        assert!(
+            pfx.join("user.reg").exists(),
+            "a cópia local nunca pode ser apagada com o prefixo ativo"
+        );
+    }
+
+    /// rsync que só falha quando invocado como upload (destino remoto, com
+    /// ':'). Olha o último argumento (`for dest; do :; done` deixa o último
+    /// em `$dest`): o download tem mais opções que o upload (`--backup
+    /// --backup-dir=...`), então nenhuma posição fixa serve pros dois.
     fn fails_only_on_upload_rsync(dir: &Path) -> std::path::PathBuf {
         write_script(
             dir,
             "fake-rsync-upload-fails.sh",
-            "case \"$7\" in\n  *:*) exit 0 ;;\n  *) exit 1 ;;\nesac",
+            "for dest; do :; done\ncase \"$dest\" in\n  *:*) exit 1 ;;\n  *) exit 0 ;;\nesac",
         )
     }
 
-    /// Download (`$7` contém `:`, formato `ssh_target:caminho`) sempre
-    /// sucede; upload (`$7` é um caminho local puro) falha sempre com o
-    /// texto exato de "diretório de origem local não existe" — modela um
-    /// jogo que abriu mas crashou antes de escrever qualquer coisa no
-    /// prefixo local, então não há nada de verdade pra sincronizar de
-    /// volta ao fim da sessão.
+    /// Download (destino local puro) sempre sucede; upload (destino no
+    /// formato `ssh_target:caminho`) falha sempre com o texto exato de
+    /// "diretório de origem local não existe" — modela um jogo que abriu
+    /// mas crashou antes de escrever qualquer coisa no prefixo local, então
+    /// não há nada de verdade pra sincronizar de volta ao fim da sessão.
     fn upload_fails_with_missing_local_dir_rsync(dir: &Path) -> std::path::PathBuf {
         write_script(
             dir,
             "fake-rsync-upload-missing.sh",
-            "case \"$7\" in\n  *:*) exit 0 ;;\n  *) echo 'rsync: [sender] change_dir \"/local/x\" \
-             failed: No such file or directory (2)' >&2; exit 23 ;;\nesac",
+            "for dest; do :; done\ncase \"$dest\" in\n  *:*) echo 'rsync: [sender] change_dir \
+             \"/local/x\" failed: No such file or directory (2)' >&2; exit 23 ;;\n  *) exit 0 ;;\nesac",
         )
     }
 

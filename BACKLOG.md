@@ -405,6 +405,59 @@ do `installed.json`/`shortcuts.vdf` desta máquina (só leitura).
 `cargo test` → **135/135 passando** (`--test-threads=1`). `cargo clippy
 --all-targets` → limpo. `cargo fmt --check` → limpo.
 
+## Proteções de fim de sessão e de download (The Sims 4, 2026-10-24)
+
+Investigando o prefixo do The Sims 4 (AppID 1222670, EA app dentro do
+Proton) que voltou quebrado no segundo download, apareceram dois riscos
+pra saves, que não têm como ser recuperados:
+
+| Risco | Correção | Onde está |
+|---|---|---|
+| Fim de sessão envia e apaga com o prefixo Wine ainda vivo (serviços do EA app, wineserver ainda sem gravar o registro) | Espera até nenhum processo ter `WINEPREFIX` apontando pro prefixo (180s, log a cada 30s), antes do envio e de novo antes da limpeza; estourou → `RunError::PrefixStillActive`, nada apagado | `src/session.rs` (`wait_for_prefix_quiet`, `prefix_users_in`, chamado em `upload_and_cleanup`) |
+| `ingest` envia/apaga (`--and-purge-local`) um prefixo vivo | Item pulado com aviso, sem espera | `src/ingest.rs` (`prefix_in_use`) |
+| Download (`rsync -a`) substitui arquivo local mais novo sem cópia | `--backup --backup-dir=~/.local/state/vault-sync/overwritten/<nome>-<unix>` em todo `full_download` (run, pull, stage); sem diretório seguro, o download é recusado | `src/rsync.rs` (`backup_dir_for`, `build_args`, `execute_with_progress`) |
+
+Decisões notáveis:
+
+- **Varredura de `/proc` por `WINEPREFIX`, não `wineserver -w`**: o
+  `wineserver -w` espera o servidor certo, mas exige achar o binário do
+  Proton que a Steam escolheu (o vault-sync não sabe qual é pra jogo
+  oficial) e não tem timeout. Todo processo Wine — inclusive o wineserver,
+  que só encerra depois de gravar o registro — tem `WINEPREFIX` no
+  ambiente, então "nenhum processo com esse `WINEPREFIX`" equivale a
+  "wineserver encerrado". A comparação é por (dispositivo, inode), o mesmo
+  critério do wineserver, e resolve pelo `/proc/<pid>/root` do processo
+  (contêiner da Steam Linux Runtime) antes do caminho do host.
+- **Timeout não envia**: o envio de um prefixo vivo é justamente o retrato
+  inconsistente que a espera evita. A mensagem manda fechar os processos e
+  rodar `vault-sync ingest --only <id>`, que reenvia o compatdata local
+  (o `ingest` nunca pula o envio de um item já remoto, ver incidente do
+  Kenshi acima).
+- **`ingest` não espera**: o `ingest` do desligamento
+  (`vault-sync-flush.service`) tem só `TimeoutStopSec=120`.
+- **`purge` ficou de fora**: é remoção irrevogável e confirmada dos dois
+  lados; não existe retrato a proteger.
+
+Pendências conhecidas:
+
+- **Poda de `overwritten/`**: não há. Esses diretórios só aparecem depois
+  de uma sessão anormal (envio que falhou, timeout acima), justamente
+  quando a cópia guardada pode ser o save mais novo que existe — apagar
+  sozinho os mais antigos contraria a prioridade de nunca perder save.
+  Candidatos se crescer demais: poda por idade (ex.: 90 dias) ou um
+  comando explícito que liste e apague.
+- **Não existe "terminar a sessão pendente"**: depois de um
+  `PrefixStillActive` (ou de qualquer falha de envio), se o usuário rodar o
+  jogo de novo antes do `ingest --only`, o download traz a cópia do
+  servidor por cima da local — agora com backup em `overwritten/`, mas o
+  jogo abre com o estado antigo até alguém restaurar.
+- **Envio sem `--delete` acumula lixo no servidor**: quando o EA app troca
+  um diretório por symlink (ou o contrário) ao se atualizar, o rsync sem
+  `--delete` não consegue propagar ("cannot delete non-empty directory",
+  código 23) e arquivos renomeados localmente continuam com o nome antigo
+  no servidor. Possível causa do prefixo quebrado; não tratado aqui
+  (`--delete` apagaria dados do servidor e merece decisão própria).
+
 ## Sobre `GameSource`
 
 Replica 1:1 a heurística já validada em `steam_scan.py`:
