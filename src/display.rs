@@ -199,6 +199,10 @@ pub fn show_list(title: &str, columns: &[&str], rows: &[Vec<String>]) {
 /// Confirmação de ação irrevogável (`purge`) via `zenity --question`.
 /// `None` quando não há sessão gráfica disponível — quem chama deve cair
 /// pro prompt de terminal nesse caso, nunca assumir uma resposta.
+/// `--no-markup` porque a pergunta pode trazer nome de jogo (`purge --name`):
+/// um `&` ali ("Ratchet & Clank") é marcação Pango inválida, e o zenity troca
+/// a pergunta inteira pelo genérico "Você tem certeza que deseja
+/// prosseguir?" — escondendo justo qual jogo vai ser apagado.
 pub fn confirm(title: &str, question: &str) -> Option<bool> {
     if !ZenitySink::is_available() {
         return None;
@@ -211,6 +215,7 @@ pub fn confirm(title: &str, question: &str) -> Option<bool> {
             "--text",
             question,
             "--no-wrap",
+            "--no-markup",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())

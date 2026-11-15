@@ -26,6 +26,7 @@ mod progress;
 mod proton;
 mod purge;
 mod remote;
+mod resolve;
 mod rsync;
 mod scan;
 mod session;
@@ -145,6 +146,105 @@ fn dispatch_pull(
     println!("[vault-sync] 'pull {app_id}' concluído: {report}");
     display::notify_result(
         &format!("vault-sync — pull {label} concluído"),
+        &report,
+        false,
+    );
+    Ok(())
+}
+
+/// Corpo de `purge`: o jogo já foi decidido por `resolve::resolve_game`
+/// (exato ou por nome, com desambiguação). Sem `--yes`, a confirmação
+/// irrevogável mostra `game.description` — o mesmo alvo que vai ser removido.
+fn dispatch_purge(cfg: &config::Config, game: &resolve::Resolved, yes: bool) -> anyhow::Result<()> {
+    println!("[vault-sync] purge de {}", game.description);
+    if !yes {
+        confirm_purge(cfg, &game.description)?;
+    }
+    execute_purge(cfg, game.launcher, &game.id, &game.label)
+}
+
+/// `--steam`/`--heroic` explícitos viram o launcher forçado; sem nenhum, o
+/// argumento é AppID numérico ou nome (ver `resolve::resolve_game`).
+fn forced_launcher(steam: bool, heroic: bool) -> Option<Launcher> {
+    heroic
+        .then_some(Launcher::Heroic)
+        .or(steam.then_some(Launcher::Steam))
+}
+
+/// Resolve o jogo de um comando que roda com o servidor ainda possivelmente
+/// dormindo: catálogo "melhor esforço" (cai pra cache se o servidor não
+/// responder) — o motor do comando religa o servidor de qualquer jeito.
+fn resolve_with_cached_catalog(
+    cfg: &config::Config,
+    text: &str,
+    forced: Option<Launcher>,
+    accepts: fn(&catalog::CatalogEntry) -> bool,
+) -> anyhow::Result<resolve::Resolved> {
+    let query = resolve::Query {
+        text,
+        forced,
+        accepts,
+        confirm_single: true,
+    };
+    resolve::resolve_game(&query, || Ok(catalog::build_catalog_best_effort(cfg)?))
+}
+
+/// Confirmação interativa de `purge` (pulada com `--yes`). `subject` é como
+/// o alvo aparece na pergunta: o id cru entre aspas no caminho exato (texto
+/// idêntico ao de sempre), a descrição resolvida — nome, tipo, identificador
+/// real — no `--name`.
+fn confirm_purge(cfg: &config::Config, subject: &str) -> anyhow::Result<()> {
+    let server_name = cfg.server_name();
+    let confirmed = confirm_irrevocable(
+        "vault-sync — purge",
+        &format!(
+            "Isto vai apagar IRREVOGAVELMENTE os dados de {subject} no {server_name} e os registros locais correspondentes.\n\nContinuar?"
+        ),
+        &format!(
+            "Isto vai apagar IRREVOGAVELMENTE os dados de {subject} no {server_name} e os registros locais correspondentes. Digite 'sim' para confirmar: "
+        ),
+    )?;
+    if !confirmed {
+        anyhow::bail!("purge cancelado — confirmação não recebida");
+    }
+    Ok(())
+}
+
+/// Remoção em si, com o alvo exato já decidido e confirmado — extraída de
+/// `Command::Purge` pra servir aos dois caminhos (exato e `--name`). `label`
+/// só muda o texto da janela/notificação (o próprio id no caminho exato, o
+/// nome resolvido no `--name`); o log continua com `app_id`, pra ficar
+/// grepável — mesmo princípio de `dispatch_pull`.
+fn execute_purge(
+    cfg: &config::Config,
+    launcher: Launcher,
+    app_id: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
+
+    let mut sink = display::pick_pulsating_sink(&format!("vault-sync — purge {label}"));
+    sink.label(&format!(
+        "removendo do {} e do disco local...",
+        cfg.server_name()
+    ));
+    let steam_root = scan::find_steam_root();
+    let result = purge::run_purge(cfg, launcher, app_id, steam_root.as_deref());
+    sink.finish();
+    let summary = result?;
+
+    let report = format!(
+        "remoto removido={}\ncompatdata local removido={}\nmanifesto local removido={}\nentradas de shortcuts.vdf removidas={}\ninstalação completa removida (local={}, remoto={})",
+        summary.remote_removed,
+        summary.local_compatdata_removed,
+        summary.local_manifest_removed,
+        summary.shortcut_entries_removed,
+        summary.full_install_removed_local,
+        summary.full_install_removed_remote,
+    );
+    println!("[vault-sync] 'purge {app_id}' concluído: {report}");
+    display::notify_result(
+        &format!("vault-sync — purge {label} concluído"),
         &report,
         false,
     );
@@ -285,20 +385,18 @@ fn main() -> anyhow::Result<()> {
             heroic,
         } => {
             let cfg = require_config(cfg, "run")?;
-            let launcher = if heroic {
-                Launcher::Heroic
-            } else {
-                debug_assert!(steam);
-                Launcher::Steam
-            };
-
-            dispatch_run(
+            let game = resolve_with_cached_catalog(
                 &cfg,
-                launcher,
                 &app_id,
-                &exec,
-                &format!("vault-sync — AppID {app_id}"),
+                forced_launcher(steam, heroic),
+                catalog::CatalogEntry::is_launchable,
             )?;
+            let title = if game.label == game.id {
+                format!("vault-sync — AppID {}", game.id)
+            } else {
+                format!("vault-sync — {}", game.label)
+            };
+            dispatch_run(&cfg, game.launcher, &game.id, &exec, &title)?;
         }
         Command::Pull {
             app_id,
@@ -306,14 +404,13 @@ fn main() -> anyhow::Result<()> {
             heroic,
         } => {
             let cfg = require_config(cfg, "pull")?;
-            let launcher = if heroic {
-                Launcher::Heroic
-            } else {
-                debug_assert!(steam);
-                Launcher::Steam
-            };
-
-            dispatch_pull(&cfg, launcher, &app_id, &app_id)?;
+            let game = resolve_with_cached_catalog(
+                &cfg,
+                &app_id,
+                forced_launcher(steam, heroic),
+                catalog::CatalogEntry::is_launchable,
+            )?;
+            dispatch_pull(&cfg, game.launcher, &game.id, &game.label)?;
         }
         Command::Catalog { format } => {
             let cfg = require_config(cfg, "catalog")?;
@@ -545,59 +642,29 @@ fn main() -> anyhow::Result<()> {
             heroic,
         } => {
             let cfg = require_config(cfg, "purge")?;
-            let launcher = if heroic {
-                Launcher::Heroic
-            } else {
-                debug_assert!(steam);
-                Launcher::Steam
+            // Catálogo AO VIVO (servidor ligado), nunca a cache: uma
+            // listagem velha poderia esconder uma segunda correspondência e
+            // fazer um nome ambíguo parecer único. Sem `--yes`, a
+            // confirmação irrevogável de `dispatch_purge` já nomeia o jogo,
+            // então a pergunta "É este?" só aparece com `--yes`.
+            let query = resolve::Query {
+                text: &app_id,
+                forced: forced_launcher(steam, heroic),
+                accepts: |_| true,
+                confirm_single: yes,
             };
-
-            if !yes {
-                let server_name = cfg.server_name();
-                let confirmed = confirm_irrevocable(
-                    "vault-sync — purge",
-                    &format!(
-                        "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes.\n\nContinuar?"
-                    ),
-                    &format!(
-                        "Isto vai apagar IRREVOGAVELMENTE os dados de '{app_id}' no {server_name} e os registros locais correspondentes. Digite 'sim' para confirmar: "
-                    ),
-                )?;
-                if !confirmed {
-                    anyhow::bail!("purge cancelado — confirmação não recebida");
-                }
-            }
-
-            remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
-
-            let mut sink = display::pick_pulsating_sink(&format!("vault-sync — purge {app_id}"));
-            sink.label(&format!(
-                "removendo do {} e do disco local...",
-                cfg.server_name()
-            ));
-            let steam_root = scan::find_steam_root();
-            let result = purge::run_purge(&cfg, launcher, &app_id, steam_root.as_deref());
-            sink.finish();
-            let summary = result?;
-
-            let report = format!(
-                "remoto removido={}\ncompatdata local removido={}\nmanifesto local removido={}\nentradas de shortcuts.vdf removidas={}\ninstalação completa removida (local={}, remoto={})",
-                summary.remote_removed,
-                summary.local_compatdata_removed,
-                summary.local_manifest_removed,
-                summary.shortcut_entries_removed,
-                summary.full_install_removed_local,
-                summary.full_install_removed_remote,
-            );
-            println!("[vault-sync] 'purge {app_id}' concluído: {report}");
-            display::notify_result(
-                &format!("vault-sync — purge {app_id} concluído"),
-                &report,
-                false,
-            );
+            let game = resolve::resolve_game(&query, || {
+                remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
+                Ok(catalog::build_catalog(&cfg)?)
+            })?;
+            dispatch_purge(&cfg, &game, yes)?;
         }
         Command::Update { app_id } => {
             let cfg = require_config(cfg, "update")?;
+            let game = resolve_with_cached_catalog(&cfg, &app_id, None, |e| {
+                matches!(e.source, domain::GameSource::Official { .. })
+            })?;
+            let app_id = game.id;
 
             // Propositalmente sem `remote::ensure_reachable` -- update.rs
             // nunca toca o FeuVault, então uma falha de SSH aqui não deveria
@@ -629,6 +696,10 @@ fn main() -> anyhow::Result<()> {
             let cfg = require_config(cfg, "ingest")?;
 
             remote::ensure_reachable("ssh", &cfg.remote_ssh_target)?;
+            let only = only
+                .map(|text| resolve_with_cached_catalog(&cfg, &text, None, |_| true))
+                .transpose()?
+                .map(|game| game.id);
 
             // `--background` já significa "sem interação/UI" (é o modo
             // usado pela unit systemd de poweroff, sem sessão gráfica

@@ -7,7 +7,7 @@
 //! scan/list/install_paths já sabem, por app_id (Steam) ou título (Heroic).
 
 use crate::config::Config;
-use crate::domain::GameSource;
+use crate::domain::{GameSource, Launcher};
 use crate::install_paths;
 use crate::list::{self, RemoteListing};
 use crate::remote::RemoteError;
@@ -86,6 +86,37 @@ impl CatalogEntry {
             GameSource::NonSteamShortcut { .. } | GameSource::HeroicGame { .. } => true,
         }
     }
+
+    /// Alvo exato que `purge::run_purge` recebe pra esta entrada — o mesmo
+    /// par que `purge <AppID> --steam`/`purge <título> --heroic` passaria.
+    /// Órfão e atalho non-Steam também são `--steam`: o `compatdata/<app_id>`
+    /// deles vive numa biblioteca Steam igual ao de um jogo oficial.
+    pub fn purge_target(&self) -> (Launcher, String) {
+        let launcher = if self.source.is_heroic() {
+            Launcher::Heroic
+        } else {
+            Launcher::Steam
+        };
+        (launcher, self.source.app_id_str())
+    }
+
+    /// O que a resolução por nome mostra pra confirmar (e em cada opção
+    /// quando o nome é ambíguo): nome completo, tipo e identificador real.
+    /// Montado a partir de `purge_target`, então o que o usuário confirma é
+    /// exatamente o alvo que o comando vai receber.
+    pub fn description(&self) -> String {
+        let kind = match self.source {
+            GameSource::Official { .. } => "Steam",
+            GameSource::NonSteamShortcut { .. } => "pirata (atalho non-Steam)",
+            GameSource::Orphan { .. } => "órfão Steam (sem manifesto/atalho)",
+            GameSource::HeroicGame { .. } => "Heroic",
+        };
+        let identifier = match self.purge_target() {
+            (Launcher::Steam, id) => format!("AppID {id}"),
+            (Launcher::Heroic, title) => format!("título do prefixo {title:?}"),
+        };
+        format!("'{}' — {kind}, {identifier}", self.display_name)
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -104,6 +135,57 @@ impl Catalog {
             .iter()
             .find(|e| e.rofi_line(server_name, client_name) == line)
     }
+
+    /// Busca fuzzy por nome, sem diferenciar maiúsculas/minúsculas nem
+    /// espaços da consulta. Dois níveis: se alguma entrada CONTÉM o texto,
+    /// só essas voltam (em ordem de catálogo); senão, voltam as que contêm
+    /// as letras da consulta em ordem (subsequência, ex.: `cybpnk` →
+    /// "Cyberpunk 2077"), as mais compactas primeiro. Nunca escolhe uma
+    /// sozinha: o que fazer com zero, uma ou várias é de quem chama.
+    /// Consulta em branco não corresponde a nada.
+    pub fn search(&self, query: &str) -> Vec<&CatalogEntry> {
+        let needle: Vec<char> = query
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .flat_map(char::to_lowercase)
+            .collect();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let lowered = query.trim().to_lowercase();
+        let (substring, rest): (Vec<_>, Vec<_>) = self
+            .entries
+            .iter()
+            .partition(|e| e.display_name.to_lowercase().contains(&lowered));
+        if !substring.is_empty() {
+            return substring;
+        }
+        let mut scored: Vec<(usize, &CatalogEntry)> = rest
+            .into_iter()
+            .filter_map(|e| subsequence_span(&needle, &e.display_name).map(|span| (span, e)))
+            .collect();
+        scored.sort_by_key(|(span, _)| *span);
+        scored.into_iter().map(|(_, e)| e).collect()
+    }
+}
+
+/// Tamanho do trecho de `haystack` que cobre `needle` como subsequência
+/// (casamento guloso a partir da primeira letra) — quanto menor, mais
+/// compacto o casamento. `None` se as letras não aparecem em ordem.
+fn subsequence_span(needle: &[char], haystack: &str) -> Option<usize> {
+    let mut wanted = needle.iter().peekable();
+    let mut start = None;
+    for (i, c) in haystack.chars().flat_map(char::to_lowercase).enumerate() {
+        if wanted.peek() != Some(&&c) {
+            continue;
+        }
+        start.get_or_insert(i);
+        wanted.next();
+        if wanted.peek().is_none() {
+            return Some(i + 1 - start.unwrap_or(i));
+        }
+    }
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -821,5 +903,108 @@ mod tests {
         let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
 
         assert_eq!(augmented.steam_compatdata_ids, Vec::<String>::new());
+    }
+
+    fn catalog_entry(source: GameSource, display_name: &str) -> CatalogEntry {
+        CatalogEntry {
+            source,
+            display_name: display_name.to_string(),
+            identity_known: true,
+            location: GameLocation::Both,
+        }
+    }
+
+    fn shortcut(app_id: u32) -> GameSource {
+        GameSource::NonSteamShortcut {
+            app_id,
+            shortcut_name: String::new(),
+        }
+    }
+
+    fn name_search_catalog() -> Catalog {
+        Catalog {
+            entries: vec![
+                catalog_entry(official(620), "Portal 2"),
+                catalog_entry(official(323180), "Portal 2 - Soundtrack"),
+                catalog_entry(shortcut(2385817016), "ReStory Playtest"),
+                catalog_entry(heroic("Hogwarts Legacy"), "Hogwarts Legacy"),
+            ],
+        }
+    }
+
+    #[test]
+    fn search_prefers_case_insensitive_substring_matches() {
+        let catalog = name_search_catalog();
+        let found = catalog.search("  restory  ");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].display_name, "ReStory Playtest");
+    }
+
+    #[test]
+    fn search_returns_every_match_instead_of_picking_one() {
+        let catalog = name_search_catalog();
+        let names: Vec<&str> = catalog
+            .search("PORTAL 2")
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Portal 2", "Portal 2 - Soundtrack"]);
+    }
+
+    #[test]
+    fn search_falls_back_to_subsequence_most_compact_first() {
+        let catalog = name_search_catalog();
+        let names: Vec<&str> = catalog
+            .search("prtl2")
+            .iter()
+            .map(|e| e.display_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["Portal 2", "Portal 2 - Soundtrack"]);
+        assert_eq!(catalog.search("hgwrts")[0].display_name, "Hogwarts Legacy");
+    }
+
+    #[test]
+    fn search_never_matches_a_blank_or_unknown_query() {
+        let catalog = name_search_catalog();
+        assert!(catalog.search("   ").is_empty());
+        assert!(catalog.search("Half-Life").is_empty());
+        assert!(catalog.search("zzz").is_empty());
+    }
+
+    #[test]
+    fn purge_target_is_the_heroic_title_or_the_steam_app_id() {
+        let orphan = GameSource::Orphan {
+            app_id: "999".to_string(),
+            clues: vec![],
+        };
+        let cases = [
+            (official(620), Launcher::Steam, "620"),
+            (shortcut(2385817016), Launcher::Steam, "2385817016"),
+            (orphan, Launcher::Steam, "999"),
+            (
+                heroic("Hogwarts Legacy"),
+                Launcher::Heroic,
+                "Hogwarts Legacy",
+            ),
+        ];
+        for (source, launcher, id) in cases {
+            let target = catalog_entry(source, "X").purge_target();
+            assert_eq!(target, (launcher, id.to_string()));
+        }
+    }
+
+    #[test]
+    fn description_shows_full_name_kind_and_real_identifier() {
+        let pirata = catalog_entry(shortcut(2385817016), "ReStory Playtest");
+        assert_eq!(
+            pirata.description(),
+            "'ReStory Playtest' — pirata (atalho non-Steam), AppID 2385817016"
+        );
+
+        let epic = catalog_entry(heroic("Hogwarts Legacy"), "Hogwarts Legacy");
+        assert_eq!(
+            epic.description(),
+            "'Hogwarts Legacy' — Heroic, título do prefixo \"Hogwarts Legacy\""
+        );
     }
 }

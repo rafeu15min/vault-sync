@@ -29,9 +29,10 @@ pub enum Command {
     /// Baixa um jogo do servidor, aguarda a execução e, ao encerrar,
     /// sincroniza de volta + limpa o SSD local. (Motor: Fase III; Heroic:
     /// Fase VI)
-    #[command(group(ArgGroup::new("launcher_run").required(true).args(["steam", "heroic"])))]
+    #[command(group(ArgGroup::new("launcher_run").args(["steam", "heroic"])))]
     Run {
-        /// AppID do jogo (Steam) ou título da pasta em Prefixes/default (Heroic)
+        /// AppID Steam, ou parte do nome do jogo (busca fuzzy no catálogo);
+        /// com `--heroic`, o título exato da pasta em Prefixes/default
         app_id: String,
 
         /// Matriz de comando do jogo, injetada pela plataforma de
@@ -41,11 +42,11 @@ pub enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         exec: Vec<String>,
 
-        /// `app_id` é um AppID numérico da Steam
+        /// Força `app_id` como AppID numérico da Steam (sem busca por nome)
         #[arg(long)]
         steam: bool,
 
-        /// `app_id` é o título de um prefixo Heroic (Prefixes/default/<título>)
+        /// Força `app_id` como título de prefixo Heroic (sem busca por nome)
         #[arg(long)]
         heroic: bool,
     },
@@ -59,34 +60,38 @@ pub enum Command {
     /// via CDN da Valve mesmo com a instalação já pronta no servidor — rode
     /// isto primeiro pra trazer os bytes certos localmente, depois abra a
     /// Steam normalmente.
-    #[command(group(ArgGroup::new("launcher_pull").required(true).args(["steam", "heroic"])))]
+    #[command(group(ArgGroup::new("launcher_pull").args(["steam", "heroic"])))]
     Pull {
-        /// AppID do jogo (Steam) ou título da pasta em Prefixes/default (Heroic)
+        /// AppID Steam, ou parte do nome do jogo (busca fuzzy no catálogo);
+        /// com `--heroic`, o título exato da pasta em Prefixes/default
         app_id: String,
 
-        /// `app_id` é um AppID numérico da Steam
+        /// Força `app_id` como AppID numérico da Steam (sem busca por nome)
         #[arg(long)]
         steam: bool,
 
-        /// `app_id` é o título de um prefixo Heroic (Prefixes/default/<título>)
+        /// Força `app_id` como título de prefixo Heroic (sem busca por nome)
         #[arg(long)]
         heroic: bool,
     },
 
     /// Remove definitivamente um jogo do servidor e apaga os registros
     /// locais correspondentes. (Motor: Fase V; Heroic: Fase VI)
-    #[command(group(ArgGroup::new("launcher_purge").required(true).args(["steam", "heroic"])))]
+    #[command(group(ArgGroup::new("launcher_purge").args(["steam", "heroic"])))]
     Purge {
+        /// AppID Steam, título do prefixo Heroic (`--heroic`) ou parte do
+        /// nome do jogo como aparece em `vault-sync catalog` (busca fuzzy)
         app_id: String,
-        /// Confirma a remoção irrevogável sem pedir confirmação interativa
+        /// Confirma a remoção irrevogável sem pedir a confirmação final
+        /// (um nome fuzzy ainda passa pela desambiguação/confirmação do jogo)
         #[arg(long)]
         yes: bool,
 
-        /// `app_id` é um AppID numérico da Steam
+        /// Força `app_id` como AppID numérico da Steam (sem busca por nome)
         #[arg(long)]
         steam: bool,
 
-        /// `app_id` é o título de um prefixo Heroic (Prefixes/default/<título>)
+        /// Força `app_id` como título de prefixo Heroic (sem busca por nome)
         #[arg(long)]
         heroic: bool,
     },
@@ -95,7 +100,7 @@ pub enum Command {
     /// `steamcmd`, direto do CDN da Valve — nunca toca o servidor,
     /// propositalmente separado de `run`/`ingest` (ver update.rs).
     Update {
-        /// AppID do jogo (Steam)
+        /// AppID Steam ou parte do nome do jogo (busca fuzzy no catálogo)
         app_id: String,
     },
 
@@ -142,8 +147,8 @@ pub enum Command {
         #[arg(long)]
         and_purge_local: bool,
 
-        /// Restringe a varredura a um único app_id (Steam) ou título
-        /// (Heroic) — todo o resto é ignorado. Pensado pra testar
+        /// Restringe a varredura a um único app_id (Steam), título (Heroic)
+        /// ou parte do nome do jogo (busca fuzzy no catálogo) — todo o resto é ignorado. Pensado pra testar
         /// `--full`/`--and-purge-local` com segurança em um jogo por vez
         /// antes de rodar sem filtro.
         #[arg(long)]
@@ -310,12 +315,9 @@ mod tests {
     }
 
     #[test]
-    fn run_requires_exactly_one_launcher_flag() {
-        let missing = Cli::try_parse_from(["vault-sync", "run", "730"]).unwrap_err();
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+    fn run_accepts_bare_id_or_name_but_not_both_flags() {
+        assert!(Cli::try_parse_from(["vault-sync", "run", "730"]).is_ok());
+        assert!(Cli::try_parse_from(["vault-sync", "run", "cyberpunk"]).is_ok());
 
         let both =
             Cli::try_parse_from(["vault-sync", "run", "730", "--steam", "--heroic"]).unwrap_err();
@@ -335,12 +337,9 @@ mod tests {
     }
 
     #[test]
-    fn purge_requires_exactly_one_launcher_flag() {
-        let missing = Cli::try_parse_from(["vault-sync", "purge", "730"]).unwrap_err();
-        assert_eq!(
-            missing.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
+    fn purge_accepts_bare_id_or_name_but_not_both_flags() {
+        assert!(Cli::try_parse_from(["vault-sync", "purge", "730"]).is_ok());
+        assert!(Cli::try_parse_from(["vault-sync", "purge", "cyberpunk"]).is_ok());
 
         let both =
             Cli::try_parse_from(["vault-sync", "purge", "730", "--steam", "--heroic"]).unwrap_err();

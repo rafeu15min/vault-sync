@@ -158,6 +158,7 @@ vault-sync run <app_id> --steam -- <comando>                        # ciclo comp
 vault-sync run <título> --heroic -- <comando>                       # idem, jogo Epic via Heroic
 vault-sync purge <app_id> --steam [--yes]                           # remoção remota irrevogável
 vault-sync purge <título> --heroic [--yes]
+vault-sync purge <parte do nome> [--yes]                            # idem, achando o jogo pelo nome (fuzzy)
 vault-sync ingest [--full] [--and-purge-local] [--only <id>] [--background]  # migra jogos local-only pro servidor
 vault-sync scan --output catalogo.json                              # varredura forense da biblioteca Steam
 vault-sync set-server-name <nome>                                   # nome de exibição do servidor (padrão "Servidor")
@@ -166,7 +167,9 @@ vault-sync set-client-name <nome>                                   # nome de ex
 
 - `--steam`/`--heroic` decidem tanto o formato do identificador (AppID
   numérico vs. título de pasta) quanto qual par de campos de config é
-  usado. Um dos dois é obrigatório em `run`/`purge`.
+  usado. São opcionais: sem nenhum, um argumento só de dígitos é AppID
+  Steam e qualquer outra coisa é busca por nome (ver abaixo). A Steam
+  continua chamando `run <id> --steam -- %command%` sem nenhuma pergunta.
 - `run` é normalmente invocado pela própria Steam/Heroic, não digitado à
   mão — ver "Ligando ao launcher" abaixo.
 - `ingest` sem `--full` só sincroniza `compatdata` (saves/prefixo,
@@ -177,6 +180,17 @@ vault-sync set-client-name <nome>                                   # nome de ex
   `--full`).
 - `purge` é **irrevogável** — remove dos dois lados (remoto e local),
   incluindo a instalação completa quando resolvível.
+- **Nome no lugar do ID** (`run`, `pull`, `update`, `purge`, `ingest
+  --only`): se o argumento não for numérico (e sem `--steam`/`--heroic`),
+  vira busca no catálogo unificado (o de `vault-sync catalog`), sem
+  diferenciar maiúsculas. Quem contém o texto aparece primeiro; se ninguém
+  contém, casa por subsequência das letras (`cybpnk` → Cyberpunk 2077), as
+  mais compactas primeiro. Um só resultado: pergunta "É este? [s/N]".
+  Vários: lista numerada e pergunta qual. Zero, Enter vazio ou sem
+  terminal (EOF): cancela sem fazer nada. `run`/`pull` só oferecem jogos
+  lançáveis e `update` só jogos Steam oficiais. `purge` usa o catálogo ao
+  vivo (liga o servidor); sem `--yes`, a confirmação irrevogável de sempre
+  já nomeia o jogo, e com `--yes` ainda há a pergunta "É este?".
 - `--only <app_id ou título>` restringe o `ingest` a um único jogo,
   ignorando o resto da varredura — essencial antes de rodar `--full` sem
   filtro nenhum pela primeira vez (senão a varredura pega tudo que é
