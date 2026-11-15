@@ -5,6 +5,15 @@ sincronizando com um servidor remoto via SSH/rsync — Steam (oficial e
 non-Steam/pirata) e Epic (via Heroic Games Launcher). Baixa um jogo pra
 jogar, sobe de volta ao fechar, e libera o espaço local.
 
+> **Menu (SUPER+G) e jogos Steam oficiais:** o menu só baixa o que faltar e
+> dispara o `steam -applaunch`; não acompanha o jogo e não envia nada ao
+> fechar. O envio é manual: `vault-sync ingest` manda os jogos novos e
+> **atualiza no servidor os arquivos que diferem, valendo sempre a versão
+> local** (sem apagar nada do servidor); `--full` inclui a instalação
+> completa e `--and-purge-local` libera o SSD depois do envio confirmado.
+> O ciclo automático sobe+apaga continua só no `run` (Opções de
+> Inicialização da Steam, Heroic e atalhos non-Steam).
+
 Ferramenta universal: nenhum nome de servidor/máquina fica cravado no
 código. Nas mensagens, "Servidor" e "Cliente" são os nomes padrão até você
 configurar os seus — ver [Nome de exibição](#nome-de-exibição-do-servidor-e-da-máquina-local).

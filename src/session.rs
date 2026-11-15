@@ -66,10 +66,6 @@ pub enum RunError {
     )]
     FullInstallNotConfigured(String),
     #[error(
-        "'steam -applaunch {0}' não iniciou uma sessão visível (processo 'reaper' da Steam Linux Runtime) em tempo — a Steam pode ter mostrado um diálogo de erro; nada foi sincronizado de volta"
-    )]
-    SteamLaunchTimeout(String),
-    #[error(
         "o processo encerrou em menos de {elapsed_secs}s com status de erro ({status}) — \
          provavelmente nunca chegou a rodar de verdade (launcher recusando o lançamento, \
          dependência ausente, config quebrada); nada foi sincronizado de volta. Rode o comando \
@@ -427,15 +423,14 @@ fn write_legendary_installed_json(
 /// vida que precisam desse "traz de volta se faltar": `run_session_with_
 /// options` (spawna e supervisiona o processo direto) e
 /// `run_via_steam_applaunch_with_options` (jogos Steam oficiais lançados
-/// via `steam -applaunch` pelo menu, onde não dá pra supervisionar o
-/// processo real — ver `dispatch_run`/`MenuLaunch` em `main.rs`).
+/// via `steam -applaunch` pelo menu, que só baixa e dispara — ver
+/// `MenuLaunch` em `main.rs`).
 struct ResolvedSession {
     source: GameSource,
     vault: RemoteVault,
     remote_paths: crate::paths::RemotePaths,
     local_targets: LocalDeletionTargets,
     full_install: Option<FullInstallTarget>,
-    library_root: PathBuf,
     // Mantido vivo pelo chamador enquanto a sessão estiver em andamento —
     // liberado automaticamente no Drop.
     _lock: LockGuard,
@@ -647,7 +642,6 @@ fn resolve_and_download(
         remote_paths,
         local_targets,
         full_install,
-        library_root: library.root.clone(),
         _lock,
     })
 }
@@ -679,7 +673,6 @@ fn run_session_with_options(
         remote_paths,
         local_targets,
         full_install,
-        library_root: _,
         _lock,
     } = resolve_and_download(
         cfg,
@@ -963,51 +956,6 @@ pub(crate) fn clean_stale_legendary_entry_at(title: &str, installed_json_path: &
     }
 }
 
-/// PID do processo `reaper` da Steam Linux Runtime pra `app_id`, se
-/// alguma sessão estiver em andamento agora. `reaper` supervisiona a
-/// árvore de processos inteira de UM lançamento (launcher + Proton + jogo
-/// real) e só termina quando ela termina de verdade — inclusive quando
-/// nada disso foi spawnado diretamente por nós (`steam -applaunch`
-/// retorna quase na hora, ver `run_via_steam_applaunch`). Varre `/proc`
-/// diretamente (sem crate extra) — mesmo espírito de baixo-nível já usado
-/// no resto do projeto (`install_paths.rs`, `scan.rs`).
-fn find_reaper_pid(app_id: &str) -> Option<u32> {
-    find_reaper_pid_in("/proc", app_id)
-}
-
-fn find_reaper_pid_in(proc_dir: &str, app_id: &str) -> Option<u32> {
-    let marker = format!("AppId={app_id}");
-    let entries = std::fs::read_dir(proc_dir).ok()?;
-    for entry in entries.flatten() {
-        let pid_str = entry.file_name().to_string_lossy().into_owned();
-        if !pid_str.chars().all(|c| c.is_ascii_digit()) {
-            continue;
-        }
-        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
-            continue;
-        };
-        if comm.trim() != "reaper" {
-            continue;
-        }
-        let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline_has_marker(&cmdline, &marker) {
-            if let Ok(pid) = pid_str.parse() {
-                return Some(pid);
-            }
-        }
-    }
-    None
-}
-
-/// `cmdline` em `/proc/<pid>/cmdline` é uma lista de argumentos separados
-/// por byte nulo (não espaço) — extraído como função pura pra ser
-/// testável sem tocar em `/proc` de verdade.
-fn cmdline_has_marker(cmdline: &str, marker: &str) -> bool {
-    cmdline.split('\0').any(|arg| arg == marker)
-}
-
 /// Quanto o fim de sessão espera o prefixo Wine do jogo ficar quieto
 /// (nenhum processo com `WINEPREFIX` apontando pra ele) antes de enviar ao
 /// servidor e apagar a cópia local. O registro do Wine (`system.reg`,
@@ -1164,44 +1112,6 @@ fn wait_for_prefix_quiet_with(
     }
 }
 
-/// Margem de segurança entre um `reaper` sumir e considerar a sessão
-/// encerrada de vez — incidente real (2026-08-16): a Steam lança **mais de
-/// um** `reaper` sequencial pro mesmo AppID (uma passada rápida de
-/// verificação/`Install=1` antes, só depois o `reaper` de verdade da
-/// sessão de jogo) — sem essa margem, o primeiro `reaper` (o de
-/// verificação) some, a "sessão" é dada como encerrada, e o upload+limpeza
-/// dispara com o jogo de verdade subindo por baixo, apagando os arquivos
-/// que ele ainda estava tentando abrir. `pid_is_alive`/PID único não
-/// bastam — a checagem precisa ser "existe ALGUM reaper pra esse AppID
-/// agora", reavaliada continuamente, não "o PID que eu vi primeiro ainda
-/// existe".
-///
-/// Segundo incidente real (2026-09-06, Kenshi): 10s não é margem
-/// suficiente — o reaper de verificação some, a compilação de shaders do
-/// jogo de verdade demora mais que isso pra terminar e só então o reaper
-/// real aparece, e os 10s estouram no meio do caminho: `run` concluiu
-/// "sincronizado e limpo" com `pid=None` em 27s (Kenshi nunca chegou a
-/// abrir), apagando os 12GB da instalação local enquanto a Steam ainda
-/// tentava subir o jogo de verdade por baixo — exatamente o cenário que
-/// este mecanismo existe pra evitar, só que com uma janela grande demais
-/// pra shader compile em jogos maiores. Custo de errar pra mais aqui é só
-/// atrasar em segundos quando o jogo fecha de verdade; custo de errar pra
-/// menos é apagar um jogo que ainda estava abrindo — a assimetria manda
-/// pecar por excesso de margem.
-///
-/// Terceiro incidente real (2026-09-12, Cyberpunk 2077): 90s de novo não
-/// bastou — a compilação de shaders de um jogo AAA grande (pior ainda logo
-/// após a Steam ter acabado de validar/reparar a instalação inteira, cache
-/// de shader zerado) passa fácil de um minuto e meio. Resultado idêntico ao
-/// incidente do Kenshi: upload+limpeza disparou com o jogo ainda no meio da
-/// compilação, apagando os 67GB da instalação completa local (o compatdata
-/// já tinha sincronizado a tempo, então nenhum dado de save/registro se
-/// perdeu — só a instalação, que precisa ser baixada de novo do FeuVault).
-/// Mesma assimetria de custo do incidente anterior, só que agora pesando
-/// mais pro lado de "espera mais": subiu de 90s pra 10 minutos.
-const REAPER_GRACE_PERIOD: Duration = Duration::from_secs(600);
-const REAPER_POLL_INTERVAL: Duration = Duration::from_secs(2);
-
 /// `comm` do processo real da Steam — `/usr/bin/steam` é só um wrapper de
 /// shell que executa `/usr/lib/steam/steam` (confirmado nesta máquina via
 /// `pacman -Qo`/leitura do script), então o nome que aparece em `/proc`
@@ -1213,32 +1123,17 @@ const STEAM_PROCESS_COMM: &str = "steam";
 /// silently`). Incidente real (2026-10-08, Red Dead Redemption 2): com os
 /// 3s antigos, o `-applaunch` chegou enquanto a Steam ainda carregava
 /// (nenhum `GameAction` no console_log) e se perdeu em silêncio — 10
-/// minutos depois, `SteamLaunchTimeout`. Só é pago num boot frio da Steam
+/// minutos depois, o lançamento tinha se perdido. Só é pago num boot frio da Steam
 /// (já rodando, `ensure_steam_running_silently_with` retorna na hora),
 /// então errar pra mais custa segundos uma vez; errar pra menos perde o
 /// lançamento inteiro.
 const STEAM_WARMUP_GRACE: Duration = Duration::from_secs(30);
 /// Tempo máximo de espera pro processo da Steam aparecer num boot frio —
-/// bem mais generoso que o de sessão de jogo (`startup_timeout` de
-/// `wait_for_steam_session`), já que carregar a própria Steam do zero é
-/// mais pesado que só despachar um `-applaunch` pra uma instância já de pé.
+/// bem mais generoso que um simples `-applaunch`, já que carregar a
+/// própria Steam do zero é mais pesado que despachar o comando pra uma
+/// instância já de pé.
 const STEAM_COLD_START_TIMEOUT: Duration = Duration::from_secs(30);
 const STEAM_POLL_INTERVAL: Duration = Duration::from_millis(500);
-
-/// Tempo máximo de espera pro `reaper` aparecer pela primeira vez depois de
-/// um `-applaunch` pelo menu (`run_via_steam_applaunch`) — separado de
-/// `REAPER_GRACE_PERIOD`, que só conta depois que o reaper já apareceu ao
-/// menos uma vez (ver comentário de `wait_for_steam_session`). Incidente
-/// real (2026-09-18, Risk of Rain 2): a Steam decidiu baixar uma atualização
-/// pendente antes de lançar o jogo — nenhum `reaper` chega a existir
-/// enquanto o download roda, então os 60s antigos estouravam bem antes do
-/// download terminar, abortando o lançamento (`SteamLaunchTimeout`) com o
-/// jogo nem chegando a abrir. Subiu pra 10 minutos, mesma generosidade de
-/// `REAPER_GRACE_PERIOD` — mesma assimetria de custo dos outros incidentes
-/// deste arquivo: esperar demais só atrasa por segundos quando o
-/// lançamento falhou de verdade, esperar de menos aborta um download
-/// legítimo no meio.
-const STEAM_APPLAUNCH_STARTUP_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn is_steam_process_running_in(proc_dir: &str) -> bool {
     let Ok(entries) = std::fs::read_dir(proc_dir) else {
@@ -1317,94 +1212,18 @@ fn ensure_steam_running_silently_with(
     }
 }
 
-/// Espera a sessão real da Steam pra `app_id` aparecer (jogo realmente
-/// começou a subir sob o Steam Linux Runtime — cobre qualquer checagem/
-/// atualização que a Steam decida fazer antes, inclusive baixar um update
-/// pendente do jogo em si, ver `STEAM_APPLAUNCH_STARTUP_TIMEOUT`) e depois
-/// desaparecer de vez (jogo fechou de verdade — com `REAPER_GRACE_PERIOD` de
-/// tolerância pra trocas de `reaper` sequenciais, ver a constante acima).
-/// Sem timeout na segunda metade: nenhum tempo de jogo é "longo demais".
-/// `startup_timeout` existe só pro primeiro lado — se nenhum `reaper`
-/// aparecer dentro dele, algo deu errado no lançamento (ex.: diálogo de
-/// erro da Steam) e não tem o que esperar. Exceção: com a atualização do
-/// jogo em andamento (`updating`), a janela recomeça a cada vez que estoura,
-/// até `STEAM_UPDATE_WAIT_MAX` — incidente real (2026-10-25, Cyberpunk
-/// 2077): 27 GB de atualização levam bem mais que os 10 minutos, e o
-/// vault-sync desistiu com a Steam ainda baixando.
-fn wait_for_steam_session(
-    app_id: &str,
-    startup_timeout: Duration,
-    library_root: &Path,
-) -> Result<(), RunError> {
-    wait_for_steam_session_with(
-        startup_timeout,
-        REAPER_GRACE_PERIOD,
-        REAPER_POLL_INTERVAL,
-        || find_reaper_pid(app_id).is_some(),
-        || {
-            let updating = crate::install_paths::is_download_in_progress(library_root, app_id);
-            if updating {
-                tracing::info!(app_id, "a Steam está atualizando o jogo — continuando a esperar");
-            }
-            updating
-        },
-    )
-    .ok_or_else(|| RunError::SteamLaunchTimeout(app_id.to_string()))
-}
-
-/// Teto da espera por uma atualização do jogo que a Steam baixa antes de
-/// lançá-lo — passando disso, volta a valer o erro de lançamento (o usuário
-/// pode ter pausado a atualização, e esperar pra sempre não ajuda).
-const STEAM_UPDATE_WAIT_MAX: Duration = Duration::from_secs(4 * 3600);
-
-/// Núcleo testável de `wait_for_steam_session`: `reaper_present` e
-/// `updating` injetados em vez de tocar `/proc` e o manifesto diretamente. `None` só quando nenhuma sessão
-/// jamais apareceu dentro de `startup_timeout` — uma vez que apareceu ao
-/// menos uma vez, sempre acaba retornando `Some(())` (só depois que
-/// `reaper_present()` ficar falso por `grace_period` contínuo).
-fn wait_for_steam_session_with(
-    startup_timeout: Duration,
-    grace_period: Duration,
-    poll_interval: Duration,
-    mut reaper_present: impl FnMut() -> bool,
-    mut updating: impl FnMut() -> bool,
-) -> Option<()> {
-    let hard_stop = Instant::now() + STEAM_UPDATE_WAIT_MAX;
-    let mut deadline = Instant::now() + startup_timeout;
-    loop {
-        if reaper_present() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            if Instant::now() >= hard_stop || !updating() {
-                return None;
-            }
-            deadline = Instant::now() + startup_timeout;
-        }
-        std::thread::sleep(poll_interval);
-    }
-
-    let mut last_seen = Instant::now();
-    loop {
-        std::thread::sleep(poll_interval);
-        if reaper_present() {
-            last_seen = Instant::now();
-        } else if last_seen.elapsed() >= grace_period {
-            return Some(());
-        }
-    }
-}
-
-/// Ciclo de vida completo pra jogos Steam oficiais lançados via `steam
-/// -applaunch` (o processo que disparamos retorna quase na hora — não dá
-/// pra `child.wait()` nele como `run_session` faz pro caso onde o processo
-/// do jogo é filho direto nosso, ver `MenuLaunch` em `main.rs`). Baixa se
-/// faltar (idêntico a `run_session`, inclusive "traz de volta" uma
-/// instalação fantasma — manifesto presente, pasta ausente), dispara o
-/// `-applaunch`, espera a sessão real da Steam via `reaper` (não o
-/// processo que disparamos) começar e depois terminar, só então
-/// sincroniza de volta e limpa — mesma garantia de segurança que
-/// `run_session` já dá, só o jeito de saber que o jogo fechou que muda.
+/// Lançamento pelo menu de jogos Steam oficiais via `steam -applaunch`: baixa
+/// o que faltar do servidor (idêntico a `run_session`, inclusive "traz de
+/// volta" uma instalação fantasma — manifesto presente, pasta ausente),
+/// dispara o `-applaunch` e **retorna na hora**. Não supervisiona o jogo e
+/// não envia nem apaga nada ao fechar: o envio é manual, via `vault-sync
+/// ingest` (`--full` inclui a instalação; `--and-purge-local` libera o SSD).
+///
+/// Decisão do usuário (2026-11-15): a supervisão pelo `reaper` da Steam Linux
+/// Runtime foi removida. Ela já tinha causado upload+limpeza com o jogo ainda
+/// abrindo (Kenshi, Cyberpunk 2077 — shader compile mais longo que a carência)
+/// e não dava conta de launchers que contam como sessão (Rockstar). Sem
+/// supervisão, não há como apagar a cópia local por engano.
 pub fn run_via_steam_applaunch(
     cfg: &Config,
     app_id: &str,
@@ -1418,12 +1237,10 @@ pub fn run_via_steam_applaunch(
         "rsync",
         "ssh",
         &LockGuard::default_path(),
-        STEAM_APPLAUNCH_STARTUP_TIMEOUT,
         on_progress,
     )
 }
 
-#[allow(clippy::too_many_arguments)]
 fn run_via_steam_applaunch_with_options(
     cfg: &Config,
     app_id: &str,
@@ -1431,17 +1248,13 @@ fn run_via_steam_applaunch_with_options(
     rsync_bin: &str,
     ssh_bin: &str,
     lock_path: &Path,
-    startup_timeout: Duration,
     mut on_progress: impl FnMut(Stage, ProgressUpdate),
 ) -> Result<GameSession, RunError> {
     let ResolvedSession {
         source,
-        vault,
-        remote_paths,
-        local_targets,
         full_install,
-        library_root,
         _lock,
+        ..
     } = resolve_and_download(
         cfg,
         Launcher::Steam,
@@ -1486,32 +1299,6 @@ fn run_via_steam_applaunch_with_options(
         .arg(app_id)
         .spawn()
         .map_err(RunError::GameSpawn)?;
-
-    on_progress(
-        Stage::Running,
-        ProgressUpdate {
-            percent: 0,
-            rate: String::new(),
-        },
-    );
-
-    wait_for_steam_session(app_id, startup_timeout, &library_root)?;
-
-    // Sempre Launcher::Steam (hardcoded acima) — `upload_and_cleanup` só usa
-    // `legendary_installed_json_path` pra fontes `GameSource::HeroicGame`,
-    // que nunca ocorrem aqui.
-    upload_and_cleanup(
-        cfg,
-        &session.source,
-        &vault,
-        &local_targets,
-        &remote_paths,
-        &full_install,
-        rsync_bin,
-        None,
-        PREFIX_QUIET_TIMEOUT,
-        &mut on_progress,
-    )?;
 
     Ok(session)
 }
@@ -1659,59 +1446,6 @@ mod tests {
     }
 
     #[test]
-    fn cmdline_has_marker_matches_exact_argument_only() {
-        assert!(cmdline_has_marker(
-            "reaper\0SteamLaunch\0AppId=1091500\0--\0foo",
-            "AppId=1091500"
-        ));
-        // Não é substring solta — "AppId=10915000" não deveria bater com
-        // "AppId=1091500" só por conter o prefixo.
-        assert!(!cmdline_has_marker(
-            "reaper\0SteamLaunch\0AppId=10915000\0--\0foo",
-            "AppId=1091500"
-        ));
-    }
-
-    #[test]
-    fn find_reaper_pid_matches_the_right_appid_among_several_processes() {
-        let dir = test_dir("proc-find-reaper");
-        // Um reaper de outro AppID (não deveria bater).
-        fake_proc_entry(
-            &dir,
-            111,
-            "reaper",
-            &["reaper", "SteamLaunch", "AppId=730", "--", "x"],
-        );
-        // Um processo qualquer com "reaper" na cmdline, mas comm diferente
-        // (não deveria bater — comm é o critério primário).
-        fake_proc_entry(
-            &dir,
-            222,
-            "bash",
-            &["bash", "-c", "echo reaper AppId=1091500"],
-        );
-        // Uma entrada não-numérica (deve ser ignorada silenciosamente, ex.:
-        // "self", "version" em /proc de verdade).
-        fs::create_dir_all(dir.join("self")).unwrap();
-        // O reaper certo.
-        fake_proc_entry(
-            &dir,
-            333,
-            "reaper",
-            &["reaper", "SteamLaunch", "AppId=1091500", "--", "x"],
-        );
-
-        let found = find_reaper_pid_in(dir.to_str().unwrap(), "1091500");
-        assert_eq!(found, Some(333));
-    }
-
-    #[test]
-    fn find_reaper_pid_returns_none_when_no_session_is_running() {
-        let dir = test_dir("proc-find-reaper-empty");
-        assert_eq!(find_reaper_pid_in(dir.to_str().unwrap(), "1091500"), None);
-    }
-
-    #[test]
     fn is_steam_process_running_in_finds_a_process_named_steam() {
         let dir = test_dir("proc-steam-running");
         fake_proc_entry(&dir, 555, "steam", &["/usr/lib/steam/steam"]);
@@ -1763,89 +1497,6 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "não deveria esperar muito além do cold_start_timeout configurado"
         );
-    }
-
-    #[test]
-    fn wait_for_steam_session_times_out_when_reaper_never_appears() {
-        // AppID que nenhuma sessão real vai ter — contra o /proc de
-        // verdade, então isso testa a função pública ponta a ponta pro
-        // caminho de timeout. O caminho de sucesso/carência é testado via
-        // `wait_for_steam_session_with` (injetável) logo abaixo.
-        let result =
-            wait_for_steam_session(
-                "999999999-teste-inexistente",
-                Duration::from_millis(50),
-                Path::new("/nao/existe"),
-            );
-        assert!(matches!(result, Err(RunError::SteamLaunchTimeout(_))));
-    }
-
-    #[test]
-    fn wait_for_steam_session_with_survives_a_gap_between_sequential_reapers() {
-        // Regressão do incidente real (2026-08-16): a Steam lança um
-        // primeiro `reaper` de verificação/instalação que some rápido,
-        // *depois* o `reaper` de verdade da sessão de jogo aparece — sem
-        // margem de carência, a primeira sumida já era tratada como "jogo
-        // fechou", disparando upload+limpeza com o jogo de verdade ainda
-        // subindo. Sequência simulada: ausente -> presente (reaper #1) ->
-        // ausente (troca) -> presente (reaper #2) -> ausente (fim de
-        // verdade, mantido até estourar a carência).
-        let sequence = [
-            false, true, true, // reaper #1 vivo
-            false, false, // troca — gap curto, dentro da carência
-            true, true, true, // reaper #2 vivo (sessão real)
-            false, false, false, false, false, false, // acabou de vez
-        ];
-        let i = std::cell::Cell::new(0);
-        let result = wait_for_steam_session_with(
-            Duration::from_millis(200),
-            Duration::from_millis(15), // carência bem menor que os testes reais, só pra ser rápido
-            Duration::from_millis(5),
-            || {
-                let idx = i.get();
-                i.set((idx + 1).min(sequence.len() - 1));
-                sequence[idx]
-            },
-            || false,
-        );
-        assert_eq!(result, Some(()));
-    }
-
-    #[test]
-    fn wait_for_steam_session_with_returns_none_when_startup_never_happens() {
-        let result = wait_for_steam_session_with(
-            Duration::from_millis(20),
-            Duration::from_millis(10),
-            Duration::from_millis(5),
-            || false,
-            || false,
-        );
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn wait_for_steam_session_with_keeps_waiting_while_steam_updates_the_game() {
-        // Regressão (2026-10-25, Cyberpunk 2077): a Steam baixa a atualização
-        // antes de lançar, sem nenhum `reaper` — estourar `startup_timeout`
-        // no meio do download abortava a sessão. Com `updating` verdadeiro, a
-        // janela recomeça; o `reaper` aparece só depois de várias janelas.
-        let polls = std::cell::Cell::new(0u32);
-        let checks = std::cell::Cell::new(0u32);
-        let result = wait_for_steam_session_with(
-            Duration::from_millis(10),
-            Duration::from_millis(10),
-            Duration::from_millis(2),
-            || {
-                polls.set(polls.get() + 1);
-                checks.get() >= 3 && polls.get() < 400 // aparece e some
-            },
-            || {
-                checks.set(checks.get() + 1);
-                checks.get() <= 3
-            },
-        );
-        assert_eq!(result, Some(()));
-        assert!(checks.get() >= 3, "a janela deveria ter recomeçado 3 vezes");
     }
 
     /// Fabrica `<fake_proc>/<pid>/{comm,environ}` — `environ` no formato

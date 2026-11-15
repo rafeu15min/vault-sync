@@ -489,22 +489,16 @@ fn main() -> anyhow::Result<()> {
             match &entry.source {
                 domain::GameSource::Official { app_id } => {
                     // `steam -applaunch` só manda um sinal pro cliente Steam
-                    // já aberto e o processo retorna quase na hora — o jogo
-                    // de verdade sobe como filho do cliente, fora de
-                    // qualquer processo que a gente controle diretamente.
-                    // `run_via_steam_applaunch` (session.rs) resolve isso
-                    // sem depender do processo que disparamos: baixa se
-                    // faltar (inclusive "traz de volta" uma instalação
-                    // fantasma — manifesto da Steam presente, pasta ausente;
-                    // incidente real: Cyberpunk 2077 apagado por um `ingest
-                    // --full --and-purge-local` anterior), dispara o
-                    // `-applaunch`, e espera o `reaper` da Steam Linux
-                    // Runtime (supervisor real da sessão, vive exatamente
-                    // enquanto o jogo roda) desaparecer antes de sincronizar
-                    // de volta e limpar — só então, nunca antes do jogo
-                    // fechar de verdade. Só pra AppID oficial — atalho
-                    // non-Steam usa outro caminho, ver o branch
-                    // `NonSteamShortcut` abaixo.
+                    // já aberto: o jogo sobe como filho do cliente, fora de
+                    // qualquer processo nosso. `run_via_steam_applaunch`
+                    // (session.rs) baixa o que faltar (inclusive "traz de
+                    // volta" uma instalação fantasma — manifesto presente,
+                    // pasta ausente; incidente real: Cyberpunk 2077 apagado
+                    // por um `ingest --full --and-purge-local` anterior) e
+                    // dispara o `-applaunch`. Nada é supervisionado nem
+                    // enviado ao fechar: o envio é manual (`vault-sync
+                    // ingest`). Só pra AppID oficial — atalho non-Steam usa
+                    // outro caminho, ver o branch `NonSteamShortcut` abaixo.
                     let app_id = app_id.to_string();
                     let steam_root = scan::find_steam_root();
                     let sink_title = format!("vault-sync — {}", entry.display_name);
@@ -536,8 +530,9 @@ fn main() -> anyhow::Result<()> {
                     };
                     tracing::info!(
                         pid = ?session.child_pid,
-                        "'{}' concluído — sincronizado de volta e limpo localmente.",
-                        entry.display_name
+                        "'{}' lançado — o envio ao {} é manual (vault-sync ingest).",
+                        entry.display_name,
+                        cfg.server_name()
                     );
                 }
                 domain::GameSource::NonSteamShortcut { app_id, .. } => {
@@ -787,7 +782,7 @@ fn main() -> anyhow::Result<()> {
             sink_cell.into_inner().finish();
 
             let mut report = format!(
-                "{} inspecionados, {} enviados, {} já presentes no {}, {} apagados localmente",
+                "{} inspecionados, {} novos enviados, {} já presentes no {} (atualizados com a versão local), {} apagados localmente",
                 summary.inspected,
                 summary.uploaded,
                 summary.skipped_existing,
@@ -797,7 +792,7 @@ fn main() -> anyhow::Result<()> {
             println!("[vault-sync] 'ingest' concluído: {report}");
             if full {
                 let full_line = format!(
-                    "{} instalações completas enviadas, {} manifestos oficiais migrados pra local_game_root_steam",
+                    "{} instalações completas novas enviadas (as já presentes foram atualizadas com a versão local), {} manifestos oficiais migrados pra local_game_root_steam",
                     summary.full_uploaded, summary.official_manifests_migrated,
                 );
                 println!("[vault-sync] 'ingest --full': {full_line}");
