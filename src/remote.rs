@@ -83,7 +83,48 @@ pub fn list_remote_dir_entries(
         "ls -1 -- {} 2>/dev/null || true",
         shell_single_quote(&remote_dir.display().to_string())
     );
-    let output = ssh_command(ssh_bin, ssh_target, &remote_cmd)
+    remote_output_lines(ssh_bin, ssh_target, &remote_cmd)
+}
+
+/// Primeira linha que contém `needle` (texto literal, `grep -F`) em cada
+/// arquivo de `remote_dir`, como pares `(nome do arquivo, linha)`. Uma
+/// conexão SSH só pra ler um campo de vários arquivos pequenos — um
+/// `read_remote_file` por arquivo custaria um handshake SSH cada, e quem usa
+/// isto (`list.rs`, lendo o `installdir` de todo retrato
+/// `steam-manifests/<app_id>.acf`) roda a cada abertura do menu SUPER+G.
+/// Diretório ausente/vazio ou nenhum casamento viram lista vazia, mesma
+/// convenção de `list_remote_dir_entries`.
+pub fn first_matching_line_per_file(
+    ssh_bin: &str,
+    ssh_target: &str,
+    remote_dir: &Path,
+    needle: &str,
+) -> Result<Vec<(String, String)>, RemoteError> {
+    let remote_cmd = format!(
+        "cd -- {} 2>/dev/null && grep -H -m1 -F -- {} * 2>/dev/null || true",
+        shell_single_quote(&remote_dir.display().to_string()),
+        shell_single_quote(needle)
+    );
+    let lines = remote_output_lines(ssh_bin, ssh_target, &remote_cmd)?;
+    // `grep -H` prefixa cada linha com `<arquivo>:` — o nome vem antes do
+    // primeiro `:`.
+    Ok(lines
+        .into_iter()
+        .filter_map(|line| {
+            let (file, matched) = line.split_once(':')?;
+            Some((file.to_string(), matched.to_string()))
+        })
+        .collect())
+}
+
+/// Roda `remote_cmd` e devolve as linhas não vazias da saída — núcleo comum
+/// das consultas só-leitura que respondem um item por linha.
+fn remote_output_lines(
+    ssh_bin: &str,
+    ssh_target: &str,
+    remote_cmd: &str,
+) -> Result<Vec<String>, RemoteError> {
+    let output = ssh_command(ssh_bin, ssh_target, remote_cmd)
         .output()
         .map_err(|e| RemoteError::Spawn(ssh_bin.to_string(), e))?;
 
@@ -323,6 +364,53 @@ mod tests {
 
         let result =
             list_remote_dir_entries(ssh.to_str().unwrap(), "feuvault", Path::new("/vault/x"));
+
+        assert!(matches!(result, Err(RemoteError::NonZeroExit(255, _))));
+    }
+
+    #[test]
+    fn first_matching_line_per_file_splits_file_name_from_matched_line() {
+        let dir = test_dir("grep-per-file");
+        // Saída real de `grep -H` com dois retratos de manifesto.
+        let ssh = fake_ssh(
+            &dir,
+            r#"printf '3812600.acf:\t"installdir"\t\t"Restory"\n233860.acf:\t"installdir"\t\t"Kenshi"\n'"#,
+        );
+
+        let pairs = first_matching_line_per_file(
+            ssh.to_str().unwrap(),
+            "feuvault",
+            Path::new("/vault/steam-manifests"),
+            "\"installdir\"",
+        )
+        .unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                (
+                    "3812600.acf".to_string(),
+                    "\t\"installdir\"\t\t\"Restory\"".to_string()
+                ),
+                (
+                    "233860.acf".to_string(),
+                    "\t\"installdir\"\t\t\"Kenshi\"".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_matching_line_per_file_reports_ssh_connection_failure() {
+        let dir = test_dir("grep-per-file-fail");
+        let ssh = fake_ssh(&dir, "exit 255");
+
+        let result = first_matching_line_per_file(
+            ssh.to_str().unwrap(),
+            "feuvault",
+            Path::new("/vault/x"),
+            "x",
+        );
 
         assert!(matches!(result, Err(RemoteError::NonZeroExit(255, _))));
     }

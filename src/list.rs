@@ -4,8 +4,10 @@
 //! servidor manualmente via `ssh`.
 
 use crate::config::Config;
+use crate::install_paths;
 use crate::remote::{self, RemoteError};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -44,6 +46,20 @@ pub struct RemoteListing {
     /// `epic_installs`, só que do lado Steam, que nunca ganhou o
     /// equivalente até agora).
     pub steam_installs: Option<Vec<String>>,
+    /// `app_id -> installdir` lido dos retratos
+    /// `remote_installs_base_path/steam-manifests/<app_id>.acf` que o
+    /// `ingest` grava junto da instalação completa
+    /// (`ingest::upload_manifest_snapshot`). É o mapeamento
+    /// app_id<->nome-de-pasta que já vive no servidor:
+    /// `catalog::augment_remote_with_full_install_only_steam_titles` cruza
+    /// com `steam_installs` pra reconhecer um jogo cuja única presença
+    /// remota é a instalação completa sem exigir `install_path_overrides.steam`
+    /// (incidente real, 2026-11-15: ReStory estava inteiro no servidor, com
+    /// retrato, e mesmo assim fora do SUPER+G por falta de override). `None`
+    /// quando `remote_installs_base_path` não está configurado — e também em
+    /// caches gravados antes deste campo existir (serde lê `Option` ausente
+    /// como `None`).
+    pub steam_manifest_installdirs: Option<BTreeMap<String, String>>,
 }
 
 /// Consulta o FeuVault de verdade e, se bem-sucedida, grava a listagem em
@@ -149,13 +165,53 @@ fn run_list_with_options(cfg: &Config, ssh_bin: &str) -> Result<RemoteListing, R
         None => None,
     };
 
+    let steam_manifest_installdirs = cfg
+        .remote_installs_base_path
+        .as_ref()
+        .map(|base| {
+            steam_manifest_installdirs(
+                ssh_bin,
+                &cfg.remote_ssh_target,
+                &base.join("steam-manifests"),
+            )
+        })
+        .transpose()?;
+
     Ok(RemoteListing {
         steam_compatdata_ids,
         heroic_titles,
         piratas_installs,
         epic_installs,
         steam_installs,
+        steam_manifest_installdirs,
     })
+}
+
+/// Lê o `installdir` de todos os retratos de manifesto do servidor numa
+/// conexão SSH só (ver `remote::first_matching_line_per_file`). Arquivo que
+/// não seja `<app_id numérico>.acf` ou sem `installdir` legível é ignorado:
+/// um retrato estranho nunca derruba a listagem inteira, só deixa de ajudar
+/// a reconhecer aquele jogo.
+fn steam_manifest_installdirs(
+    ssh_bin: &str,
+    ssh_target: &str,
+    manifests_dir: &std::path::Path,
+) -> Result<BTreeMap<String, String>, RemoteError> {
+    let lines =
+        remote::first_matching_line_per_file(ssh_bin, ssh_target, manifests_dir, "\"installdir\"")?;
+    Ok(lines
+        .iter()
+        .filter_map(|(file, line)| manifest_snapshot_entry(file, line))
+        .collect())
+}
+
+fn manifest_snapshot_entry(file: &str, line: &str) -> Option<(String, String)> {
+    let app_id = file.strip_suffix(".acf")?;
+    if app_id.is_empty() || !app_id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let installdir = install_paths::parse_installdir_from_acf(line)?;
+    Some((app_id.to_string(), installdir))
 }
 
 #[cfg(test)]
@@ -313,6 +369,58 @@ mod tests {
     }
 
     #[test]
+    fn omits_steam_manifest_installdirs_when_remote_installs_base_path_unconfigured() {
+        let dir = test_dir("steam-manifests-unconfigured");
+        let ssh = fake_ssh(&dir, "printf ''");
+
+        let listing = run_list_with_options(&cfg_steam_only(), ssh.to_str().unwrap()).unwrap();
+
+        assert_eq!(listing.steam_manifest_installdirs, None);
+    }
+
+    #[test]
+    fn maps_steam_manifest_snapshots_to_installdir_skipping_unrecognized_files() {
+        let dir = test_dir("steam-manifests-configured");
+        // O fake responde igual pra toda consulta; só a de retratos tem o
+        // formato `<arquivo>:<linha>` do `grep -H`. Nome não numérico, outra
+        // extensão e linha sem `installdir` legível ficam de fora.
+        let ssh = fake_ssh(
+            &dir,
+            r#"printf '3812600.acf:\t"installdir"\t\t"Restory"\nnotas.acf:\t"installdir"\t\t"X"\n42.txt:\t"installdir"\t\t"Y"\n7.acf:lixo\n'"#,
+        );
+        let cfg = Config {
+            remote_installs_base_path: Some(std::path::PathBuf::from("/vault/game-installs")),
+            ..cfg_steam_only()
+        };
+
+        let listing = run_list_with_options(&cfg, ssh.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            listing.steam_manifest_installdirs,
+            Some(BTreeMap::from([(
+                "3812600".to_string(),
+                "Restory".to_string()
+            )]))
+        );
+    }
+
+    #[test]
+    fn cache_written_before_manifest_field_existed_still_reads() {
+        let dir = test_dir("cache-old-format");
+        let path = dir.join("remote_catalog_cache.json");
+        fs::write(
+            &path,
+            r#"{"steam_compatdata_ids":["100"],"heroic_titles":null,"piratas_installs":null,"epic_installs":null,"steam_installs":["Kenshi"]}"#,
+        )
+        .unwrap();
+
+        let listing = read_cache_from(&path).expect("cache antigo continua legível");
+
+        assert_eq!(listing.steam_installs, Some(vec!["Kenshi".to_string()]));
+        assert_eq!(listing.steam_manifest_installdirs, None);
+    }
+
+    #[test]
     fn cache_round_trips_a_written_listing() {
         let dir = test_dir("cache-round-trip");
         let path = dir.join("remote_catalog_cache.json");
@@ -322,6 +430,10 @@ mod tests {
             piratas_installs: Some(vec!["Haste".to_string()]),
             epic_installs: Some(vec!["DiscoElysium".to_string()]),
             steam_installs: Some(vec!["Kenshi".to_string()]),
+            steam_manifest_installdirs: Some(BTreeMap::from([(
+                "233860".to_string(),
+                "Kenshi".to_string(),
+            )])),
         };
 
         write_cache_to(&path, &listing);

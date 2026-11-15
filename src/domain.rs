@@ -68,6 +68,15 @@ impl GameSource {
     pub fn display_name(&self) -> String {
         match self {
             GameSource::Official { app_id } => format!("Steam AppID {app_id}"),
+            // Atalho sem nome (compatdata remoto/local cujo atalho já saiu de
+            // todo `shortcuts.vdf` e sem override de pirata) cai no mesmo
+            // fallback do oficial: um nome vazio virava uma linha
+            // `[Steam (non-Steam)]  (...)` muda no topo do SUPER+G
+            // (incidente real, 2026-11-15: AppID 2584881635).
+            GameSource::NonSteamShortcut {
+                app_id,
+                shortcut_name,
+            } if shortcut_name.is_empty() => format!("Steam AppID {app_id}"),
             GameSource::NonSteamShortcut { shortcut_name, .. } => shortcut_name.clone(),
             GameSource::Orphan { app_id, clues } if !clues.is_empty() => {
                 format!("Órfão {app_id} (pistas: {})", clues.join(" | "))
@@ -163,5 +172,20 @@ mod tests {
             .app_id_str(),
             "999"
         );
+    }
+
+    #[test]
+    fn nameless_shortcut_falls_back_to_app_id_instead_of_an_empty_name() {
+        let nameless = GameSource::NonSteamShortcut {
+            app_id: 2584881635,
+            shortcut_name: String::new(),
+        };
+        let named = GameSource::NonSteamShortcut {
+            app_id: 1,
+            shortcut_name: "Phonopolis".into(),
+        };
+
+        assert_eq!(nameless.display_name(), "Steam AppID 2584881635");
+        assert_eq!(named.display_name(), "Phonopolis");
     }
 }

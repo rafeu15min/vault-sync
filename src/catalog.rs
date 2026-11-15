@@ -322,12 +322,16 @@ fn augment_remote_with_full_install_only_epic_titles(
 /// catálogo mesmo 100% presente no servidor (incidente real, 2026-09-09:
 /// Kenshi — compatdata só local, nunca existiu remoto; instalação completa
 /// só remota, nunca local — nenhum dos dois lados bastava sozinho pro
-/// catálogo antigo reconhecer o jogo). `install_path_overrides.steam`
-/// (app_id -> pasta local) é o único mapeamento app_id<->nome-de-pasta que
-/// sobrevive a essa lacuna dupla; sem override configurado pra esse app_id,
-/// não tem como saber o nome da pasta remota, e ele continua invisível
-/// (mesmo comportamento de antes, sem regressão pra quem não configurou
-/// nada).
+/// catálogo antigo reconhecer o jogo). O mapeamento app_id<->nome-de-pasta
+/// vem de duas fontes: `install_path_overrides.steam` (app_id -> pasta
+/// local, configurado à mão) e os retratos `steam-manifests/<app_id>.acf`
+/// que o `ingest` já grava no servidor (`remote.steam_manifest_installdirs`
+/// — incidente real, 2026-11-15: ReStory tinha instalação completa e
+/// retrato no servidor, mas sem override ficava fora do SUPER+G). O retrato
+/// é o mesmo que `session::restore_official_manifest_snapshot` usa pra
+/// trazer o jogo de volta, então o que aparece por aqui também é lançável.
+/// Sem nenhuma das duas fontes pra esse app_id, não tem como saber o nome da
+/// pasta remota, e ele continua invisível (mesmo comportamento de antes).
 fn augment_remote_with_full_install_only_steam_titles(
     cfg: &Config,
     mut remote: list::RemoteListing,
@@ -335,22 +339,29 @@ fn augment_remote_with_full_install_only_steam_titles(
     let Some(steam_installs) = &remote.steam_installs else {
         return remote;
     };
-    let already_known: HashSet<&str> = remote
-        .steam_compatdata_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
-    let extra: Vec<String> = cfg
+    let on_server: HashSet<&str> = steam_installs.iter().map(String::as_str).collect();
+    // Já conhecidos via compatdata não entram de novo; o `insert` abaixo
+    // também impede o mesmo app_id duas vezes quando override e retrato
+    // apontam pro mesmo jogo.
+    let mut known: HashSet<String> = remote.steam_compatdata_ids.iter().cloned().collect();
+    let from_overrides = cfg
         .install_path_overrides
         .steam
         .iter()
-        .filter(|(app_id, _)| !already_known.contains(app_id.as_str()))
-        .filter(|(_, path)| {
-            path.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .is_some_and(|n| steam_installs.contains(&n))
-        })
-        .map(|(app_id, _)| app_id.clone())
+        .filter_map(|(app_id, path)| {
+            let folder = path.file_name()?.to_string_lossy().into_owned();
+            Some((app_id.clone(), folder))
+        });
+    let from_snapshots = remote
+        .steam_manifest_installdirs
+        .iter()
+        .flatten()
+        .map(|(app_id, folder)| (app_id.clone(), folder.clone()));
+    let extra: Vec<String> = from_overrides
+        .chain(from_snapshots)
+        .filter(|(_, folder)| on_server.contains(folder.as_str()))
+        .filter(|(app_id, _)| known.insert(app_id.clone()))
+        .map(|(app_id, _)| app_id)
         .collect();
     if extra.is_empty() {
         return remote;
@@ -629,6 +640,7 @@ mod tests {
             piratas_installs: None,
             epic_installs: None,
             steam_installs: None,
+            steam_manifest_installdirs: None,
         }
     }
 
@@ -903,6 +915,49 @@ mod tests {
         let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
 
         assert_eq!(augmented.steam_compatdata_ids, Vec::<String>::new());
+    }
+
+    fn remote_with_snapshot(installs: &[&str], app_id: &str, installdir: &str) -> RemoteListing {
+        let mut remote = remote(&[], None);
+        remote.steam_installs = Some(installs.iter().map(|s| s.to_string()).collect());
+        remote.steam_manifest_installdirs = Some(std::collections::BTreeMap::from([(
+            app_id.to_string(),
+            installdir.to_string(),
+        )]));
+        remote
+    }
+
+    #[test]
+    fn augment_recognizes_steam_game_via_server_manifest_snapshot_without_override() {
+        // Regressão real (2026-11-15): ReStory tinha instalação completa e
+        // retrato `steam-manifests/3812600.acf` no servidor, sem compatdata
+        // nem override — o retrato sozinho já diz qual pasta é de qual AppID.
+        let cfg = Config::test_default();
+        let remote = remote_with_snapshot(&["Restory", "Kenshi"], "3812600", "Restory");
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, vec!["3812600".to_string()]);
+    }
+
+    #[test]
+    fn augment_ignores_snapshot_whose_install_folder_is_not_on_the_server() {
+        let cfg = Config::test_default();
+        let remote = remote_with_snapshot(&["OutroJogo"], "3812600", "Restory");
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, Vec::<String>::new());
+    }
+
+    #[test]
+    fn augment_lists_app_id_once_when_override_and_snapshot_agree() {
+        let cfg = cfg_with_steam_override("233860", "Kenshi");
+        let remote = remote_with_snapshot(&["Kenshi"], "233860", "Kenshi");
+
+        let augmented = augment_remote_with_full_install_only_steam_titles(&cfg, remote);
+
+        assert_eq!(augmented.steam_compatdata_ids, vec!["233860".to_string()]);
     }
 
     fn catalog_entry(source: GameSource, display_name: &str) -> CatalogEntry {
