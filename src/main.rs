@@ -233,7 +233,7 @@ fn execute_purge(
     sink.finish();
     let summary = result?;
 
-    let report = format!(
+    let mut report = format!(
         "remoto removido={}\ncompatdata local removido={}\nmanifesto local removido={}\nentradas de shortcuts.vdf removidas={}\ninstalação completa removida (local={}, remoto={})",
         summary.remote_removed,
         summary.local_compatdata_removed,
@@ -241,7 +241,12 @@ fn execute_purge(
         summary.shortcut_entries_removed,
         summary.full_install_removed_local,
         summary.full_install_removed_remote,
-    );
+   );
+    if summary.full_install_unresolved {
+        report.push_str(
+            "\nATENÇÃO: nenhuma instalação completa foi identificada (sem manifesto, override nem retrato no servidor). Se existir uma pasta do jogo em game-installs/ no servidor, ela NÃO foi removida.",
+        );
+    }
     println!("[vault-sync] 'purge {app_id}' concluído: {report}");
     display::notify_result(
         &format!("vault-sync — purge {label} concluído"),

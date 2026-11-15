@@ -189,6 +189,12 @@ vault-sync set-client-name <nome>                                   # nome de ex
   `--full`).
 - `purge` é **irrevogável** — remove dos dois lados (remoto e local),
   incluindo a instalação completa quando resolvível.
+  O nome da pasta de instalação vem do manifesto local (qualquer
+  biblioteca), do override `install_path_overrides.steam` ou do retrato
+  `steam-manifests/<id>.acf` do servidor, que o `purge` também apaga. Se
+  nada disso existir (jogo nunca adotado com manifesto), o resumo avisa
+  "nenhuma instalação completa foi identificada" e a pasta em
+  `game-installs/` precisa ser removida à mão.
 - **Nome no lugar do ID** (`run`, `pull`, `update`, `purge`, `ingest
   --only`): se o argumento não for numérico (e sem `--steam`/`--heroic`),
   vira busca no catálogo unificado (o de `vault-sync catalog`), sem

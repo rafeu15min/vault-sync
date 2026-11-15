@@ -27,6 +27,11 @@ pub struct PurgeSummary {
     /// remover além do compatdata já tratado acima.
     pub full_install_removed_local: bool,
     pub full_install_removed_remote: bool,
+    /// `true` quando há `remote_installs_base_path` mas nenhuma instalação
+    /// completa pôde ser identificada (sem manifesto local, override nem
+    /// retrato no servidor): uma pasta do jogo em `game-installs/` pode ter
+    /// sobrado e precisa ser removida à mão.
+    pub full_install_unresolved: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,75 +140,42 @@ fn run_purge_with_options(
     }
 
     // Fase VII, melhor esforço: instalação completa (Steam oficial via
-    // manifesto, pirata via `scan::resolve_piratas_install_dir`, Epic via
-    // raiz configurada — nunca via `installed.json` do Legendary, que já
-    // provou ficar obsoleto sozinho; o caminho canônico pra jogos
-    // rastreados é sempre `local_game_root_epic/<título>` ou
-    // `local_game_root_piratas/<nome>`, ver `session.rs`). Não resolver não
-    // é erro — só significa que não há nada de instalação completa pra
-    // remover além do compatdata já tratado acima.
+    // manifesto local, override ou retrato salvo no servidor; pirata via
+    // `scan::resolve_piratas_install_dir`; Epic via raiz configurada —
+    // nunca via `installed.json` do Legendary, que já provou ficar
+    // obsoleto sozinho; o caminho canônico pra jogos rastreados é sempre
+    // `local_game_root_epic/<título>` ou `local_game_root_piratas/<nome>`,
+    // ver `session.rs`). Não resolver não é erro — só significa que não há
+    // nada de instalação completa pra remover além do compatdata já
+    // tratado acima, e fica registrado em `full_install_unresolved`.
     if let Some(remote_installs_base) = &cfg.remote_installs_base_path {
-        let full_install: Option<(&'static str, PathBuf, String)> = match launcher {
-            Launcher::Steam => {
-                let official = cfg.local_game_root_steam.as_ref().and_then(|root| {
-                    install_paths::manifest_installdir(root, app_id).map(|name| {
-                        let local_dir = root.join("steamapps").join("common").join(&name);
-                        ("steam", local_dir, name)
-                    })
-                });
-                official.or_else(|| {
-                    // Mesma prioridade do `session.rs` — ver
-                    // `scan::resolve_piratas_install_dir`.
-                    let numeric_app_id = app_id.trim().parse::<u32>().ok()?;
-                    let local_dir = scan::resolve_piratas_install_dir(
-                        cfg.install_path_overrides
-                            .piratas
-                            .get(app_id)
-                            .map(PathBuf::as_path),
-                        cfg.local_game_root_piratas.as_deref(),
-                        steam_root,
-                        numeric_app_id,
-                    )?;
-                    let name = local_dir.file_name()?.to_string_lossy().into_owned();
-                    Some(("piratas", local_dir, name))
-                })
+        match resolve_full_install(cfg, launcher, app_id, steam_root, ssh_bin) {
+            Some(full) => remove_full_install(
+                &full,
+                remote_installs_base,
+                &vault.ssh_target,
+                ssh_bin,
+                launcher,
+                legendary_installed_json_path,
+                &mut summary,
+            )?,
+            None => {
+                summary.full_install_unresolved = true;
+                tracing::warn!(
+                    app_id,
+                    "nenhuma instalação completa rastreada (sem manifesto, override nem retrato \
+                     no servidor) — se existir uma pasta do jogo em game-installs/, o purge não a removeu"
+                );
             }
-            Launcher::Heroic => cfg
-                .local_game_root_epic
-                .as_ref()
-                .map(|root| ("epic", root.join(app_id), app_id.to_string())),
-        };
-
-        if let Some((category, local_dir, name)) = full_install {
-            // Guarda central contra caminho raso demais/`$HOME` vindo de
-            // metadado de launcher externo (StartDir do Lutris, override
-            // stale...) — mesma checagem de `install_paths::verified_candidate`.
-            // Incidente real: StartDir="/home/rafeu" quase apagou a home
-            // inteira num `remove_dir_all` sem essa guarda.
-            if local_dir.exists() {
-                if install_paths::is_safe_install_dir(&local_dir, dirs::home_dir().as_deref()) {
-                    std::fs::remove_dir_all(&local_dir).map_err(PurgeError::Io)?;
-                    summary.full_install_removed_local = true;
-                    // Sem isto, o `installed.json` do Legendary continua
-                    // afirmando que `app_id` (o título, pra Heroic) está
-                    // instalado na pasta que acabamos de apagar — mesmo gap
-                    // que existia em `session.rs::upload_and_cleanup` antes
-                    // de ser corrigido (ver doc ali).
-                    if launcher == Launcher::Heroic {
-                        if let Some(installed_json) = legendary_installed_json_path {
-                            crate::session::clean_stale_legendary_entry_at(app_id, installed_json);
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        ?local_dir,
-                        "recusando remove_dir_all: caminho raso demais ou dentro de $HOME"
-                    );
-                }
-            }
-            let remote_dir = remote_installs_base.join(category).join(&name);
-            remote::remove_remote_path(ssh_bin, &vault.ssh_target, &remote_dir)?;
-            summary.full_install_removed_remote = true;
+        }
+        // O retrato do manifesto vive fora da pasta do jogo; sem apagá-lo,
+        // o próximo `run` o "restauraria" pra um jogo que já não existe.
+        // Só depois de resolver o nome acima, que pode depender dele.
+        if launcher == Launcher::Steam {
+            let snapshot = remote_installs_base
+                .join("steam-manifests")
+                .join(format!("{app_id}.acf"));
+            remote::remove_remote_path(ssh_bin, &vault.ssh_target, &snapshot)?;
         }
     }
 
@@ -223,6 +195,148 @@ fn run_purge_with_options(
     }
 
     Ok(summary)
+}
+
+/// Instalação completa de um jogo: categoria no servidor (`steam`/`piratas`/
+/// `epic`), nome da pasta e, quando conhecida, a pasta local.
+struct FullInstall {
+    category: &'static str,
+    name: String,
+    local_dir: Option<PathBuf>,
+}
+
+/// Nome de pasta simples: sem separador, sem `.`/`..`. Obrigatório antes de
+/// juntar um nome vindo de fora (manifesto, retrato do servidor) a um
+/// caminho que vai pra `rm -rf`.
+fn is_plain_dir_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains(['/', '\\', '\0'])
+}
+
+/// `installdir` de um jogo Steam oficial sem depender de a Steam ainda
+/// lembrar dele. Em ordem: manifesto local (raiz do vault-sync, depois as
+/// demais bibliotecas), `install_path_overrides.steam` e, por último, o
+/// retrato `steam-manifests/<app_id>.acf` salvo no servidor pelo `ingest`.
+/// Sem isto, depois de um `ingest --and-purge-local` (que apaga o manifesto
+/// local) o `purge` não achava a pasta no servidor e a deixava pra trás.
+fn official_install_name(cfg: &Config, app_id: &str, ssh_bin: &str) -> Option<String> {
+    let local_manifest = || {
+        cfg.local_game_root_steam
+            .iter()
+            .chain(&cfg.local_libraries)
+            .find_map(|lib| install_paths::manifest_installdir(lib, app_id))
+    };
+    let from_override = || {
+        let path = cfg.install_path_overrides.steam.get(app_id)?;
+        Some(path.file_name()?.to_string_lossy().into_owned())
+    };
+    let from_snapshot = || {
+        let snapshot = cfg
+            .remote_installs_base_path
+            .as_ref()?
+            .join("steam-manifests")
+            .join(format!("{app_id}.acf"));
+        let content = remote::read_remote_file(ssh_bin, &cfg.remote_ssh_target, &snapshot)
+            .ok()
+            .flatten()?;
+        install_paths::parse_installdir_from_acf(&content)
+    };
+    local_manifest()
+        .or_else(from_override)
+        .or_else(from_snapshot)
+        .filter(|name| is_plain_dir_name(name))
+}
+
+/// Mesma prioridade do `session.rs`: oficial, depois pirata (ver
+/// `scan::resolve_piratas_install_dir`); Heroic usa a raiz Epic.
+fn resolve_full_install(
+    cfg: &Config,
+    launcher: Launcher,
+    app_id: &str,
+    steam_root: Option<&Path>,
+    ssh_bin: &str,
+) -> Option<FullInstall> {
+    if launcher == Launcher::Heroic {
+        let root = cfg.local_game_root_epic.as_ref()?;
+        return Some(FullInstall {
+            category: "epic",
+            name: app_id.to_string(),
+            local_dir: Some(root.join(app_id)),
+        });
+    }
+    if let Some(name) = official_install_name(cfg, app_id, ssh_bin) {
+        let local_dir = cfg
+            .local_game_root_steam
+            .as_ref()
+            .map(|root| root.join("steamapps").join("common").join(&name));
+        return Some(FullInstall {
+            category: "steam",
+            name,
+            local_dir,
+        });
+    }
+    let numeric_app_id = app_id.trim().parse::<u32>().ok()?;
+    let local_dir = scan::resolve_piratas_install_dir(
+        cfg.install_path_overrides
+            .piratas
+            .get(app_id)
+            .map(PathBuf::as_path),
+        cfg.local_game_root_piratas.as_deref(),
+        steam_root,
+        numeric_app_id,
+    )?;
+    let name = local_dir.file_name()?.to_string_lossy().into_owned();
+    Some(FullInstall {
+        category: "piratas",
+        name,
+        local_dir: Some(local_dir),
+    })
+}
+
+/// Apaga a instalação completa local (só se o caminho for seguro). Incidente
+/// real: StartDir="/home/rafeu" quase apagou a home inteira num
+/// `remove_dir_all` sem a guarda — mesma checagem de
+/// `install_paths::verified_candidate`.
+fn remove_local_install(
+    full: &FullInstall,
+    launcher: Launcher,
+    legendary_installed_json_path: Option<&Path>,
+    summary: &mut PurgeSummary,
+) -> Result<(), PurgeError> {
+    let Some(local_dir) = full.local_dir.as_ref().filter(|d| d.exists()) else {
+        return Ok(());
+    };
+    if !install_paths::is_safe_install_dir(local_dir, dirs::home_dir().as_deref()) {
+        tracing::warn!(
+            ?local_dir,
+            "recusando remove_dir_all: caminho raso demais ou dentro de $HOME"
+        );
+        return Ok(());
+    }
+    std::fs::remove_dir_all(local_dir).map_err(PurgeError::Io)?;
+    summary.full_install_removed_local = true;
+    // Sem isto, o `installed.json` do Legendary continua afirmando que o
+    // título está instalado na pasta que acabamos de apagar.
+    if let (Launcher::Heroic, Some(installed_json)) = (launcher, legendary_installed_json_path) {
+        crate::session::clean_stale_legendary_entry_at(&full.name, installed_json);
+    }
+    Ok(())
+}
+
+/// Apaga a instalação completa, local e remota.
+fn remove_full_install(
+    full: &FullInstall,
+    remote_installs_base: &Path,
+    ssh_target: &str,
+    ssh_bin: &str,
+    launcher: Launcher,
+    legendary_installed_json_path: Option<&Path>,
+    summary: &mut PurgeSummary,
+) -> Result<(), PurgeError> {
+    remove_local_install(full, launcher, legendary_installed_json_path, summary)?;
+    let remote_dir = remote_installs_base.join(full.category).join(&full.name);
+    remote::remove_remote_path(ssh_bin, ssh_target, &remote_dir)?;
+    summary.full_install_removed_remote = true;
+    Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -674,5 +788,99 @@ mod tests {
         assert!(summary.full_install_removed_local);
         assert!(summary.full_install_removed_remote);
         assert!(!real_install_dir.exists());
+    }
+
+    /// ssh falso que registra cada comando e responde à leitura do retrato
+    /// do manifesto (`cat --`) com `snapshot` (ou "ausente", código 44).
+    fn fake_ssh_with_snapshot(dir: &Path, log: &Path, snapshot: Option<&str>) -> PathBuf {
+        let answer = match snapshot {
+            Some(content) => format!("printf '%s' '{content}'; exit 0"),
+            None => "exit 44".to_string(),
+        };
+        fake_ssh(
+            dir,
+            &format!(
+                "echo \"$@\" >> '{}'\ncase \"$*\" in *'cat --'*) {answer};; esac\nexit 0",
+                log.display()
+            ),
+        )
+    }
+
+    #[test]
+    fn purge_without_local_manifest_finds_install_via_server_snapshot() {
+        let dir = test_dir("full-snapshot");
+        let local_lib = dir.join("ssd");
+        fs::create_dir_all(&local_lib).unwrap();
+        let log = dir.join("ssh.log");
+        let ssh = fake_ssh_with_snapshot(&dir, &log, Some("\"installdir\"\t\t\"Meu Jogo\""));
+        let remote_installs = dir.join("remote-installs");
+
+        let summary = run_purge_with_options(
+            &cfg_with_full_steam(&local_lib, &remote_installs),
+            Launcher::Steam,
+            "42",
+            None,
+            ssh.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert!(summary.full_install_removed_remote);
+        assert!(!summary.full_install_unresolved);
+        let calls = fs::read_to_string(&log).unwrap();
+        assert!(calls.contains(&format!("{}/steam/Meu Jogo", remote_installs.display())));
+        assert!(calls.contains("steam-manifests/42.acf"));
+    }
+
+    #[test]
+    fn purge_flags_unresolved_install_instead_of_staying_silent() {
+        let dir = test_dir("full-unresolved");
+        let local_lib = dir.join("ssd");
+        fs::create_dir_all(&local_lib).unwrap();
+        let log = dir.join("ssh.log");
+        let ssh = fake_ssh_with_snapshot(&dir, &log, None);
+
+        let summary = run_purge_with_options(
+            &cfg_with_full_steam(&local_lib, &dir.join("remote-installs")),
+            Launcher::Steam,
+            "42",
+            None,
+            ssh.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert!(summary.full_install_unresolved);
+        assert!(!summary.full_install_removed_remote);
+    }
+
+    #[test]
+    fn purge_refuses_an_install_name_that_escapes_the_directory() {
+        let dir = test_dir("full-evil-name");
+        let local_lib = dir.join("ssd");
+        fs::create_dir_all(&local_lib).unwrap();
+        let log = dir.join("ssh.log");
+        let ssh = fake_ssh_with_snapshot(&dir, &log, Some("\"installdir\"\t\t\"../../etc\""));
+
+        let summary = run_purge_with_options(
+            &cfg_with_full_steam(&local_lib, &dir.join("remote-installs")),
+            Launcher::Steam,
+            "42",
+            None,
+            ssh.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert!(summary.full_install_unresolved);
+        assert!(!fs::read_to_string(&log).unwrap().contains("etc"));
+    }
+
+    #[test]
+    fn plain_dir_name_rejects_separators_and_dots() {
+        assert!(is_plain_dir_name("Keep Talking and Nobody Explodes"));
+        for bad in ["", ".", "..", "a/b", "../x", "a\\b"] {
+            assert!(!is_plain_dir_name(bad), "{bad:?}");
+        }
     }
 }
