@@ -27,6 +27,7 @@ mod proton;
 mod purge;
 mod remote;
 mod resolve;
+mod room;
 mod rsync;
 mod scan;
 mod session;

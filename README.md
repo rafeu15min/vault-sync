@@ -97,6 +97,8 @@ cp config.example.json ~/.config/vault-sync/config.json
 | `local_game_root_piratas` | não | Idem, non-Steam/pirata (informativo — `run`/`ingest` usam o `StartDir` já gravado no atalho, não este campo) |
 | `local_game_root_epic` | não | Raiz local unificada p/ instalação completa Epic/Heroic |
 | `remote_installs_base_path` | não | Raiz remota única p/ instalações completas dos 3 tipos |
+| `anubis_url` | não | URL do Anubis no servidor (ex.: `http://192.168.1.80:7070`). Com ela, `ingest --full` pede espaço ao Anubis (`POST /storage/prune`) antes de enviar uma instalação **nova**: o Anubis apaga mídia já vista, depois a mais antiga, até o disco ficar com no máximo 85 % usado depois do jogo. Jogo nunca é apagado. Só funciona com `dry_run = false` no Anubis; se ele recusar, não responder ou não conseguir liberar o bastante, o envio daquele jogo é abortado |
+| `anubis_token` | não | `server.token` do Anubis (cabeçalho `Authorization: Bearer`) |
 | `install_path_overrides` | não | Correção manual de onde um jogo específico está instalado — ver abaixo |
 | `server_name` | não | Nome de exibição do servidor remoto nas mensagens/catálogo — padrão `"Servidor"` se omitido. Ver abaixo. |
 | `client_name` | não | Nome de exibição desta máquina local nas mensagens/catálogo — padrão `"Cliente"` se omitido. Ver abaixo. |

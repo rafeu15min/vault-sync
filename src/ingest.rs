@@ -66,6 +66,12 @@ pub enum IngestError {
         #[source]
         source: TransferError,
     },
+    #[error("não foi possível abrir espaço no servidor para '{app_id}': {source}")]
+    MakeRoom {
+        app_id: String,
+        #[source]
+        source: crate::room::RoomError,
+    },
     #[error("upload de '{app_id}' concluído, mas falhou ao limpar o local: {source}")]
     Cleanup {
         app_id: String,
@@ -197,6 +203,7 @@ fn sync_full_install(
 /// serem genuinamente diferentes por categoria.
 #[allow(clippy::too_many_arguments)]
 fn sync_full_install_and_report(
+    cfg: &Config,
     ssh_target: &str,
     rsync_bin: &str,
     category: &str,
@@ -215,6 +222,14 @@ fn sync_full_install_and_report(
         .unwrap_or(false);
     if !already_remote {
         on_uploading(&format!("{label} (instalação completa)"));
+        // Jogo novo no servidor: pede espaço ao Anubis antes de enviar (no-op
+        // sem `anubis_url`). Só a instalação completa — é ela que pesa.
+        crate::room::ensure_room(cfg, crate::room::dir_size(install_dir)).map_err(|source| {
+            IngestError::MakeRoom {
+                app_id: id_or_title.to_string(),
+                source,
+            }
+        })?;
     }
     let synced = sync_full_install(
         ssh_target,
@@ -1016,6 +1031,7 @@ fn run_steam_compatdata_pass(
                             piratas_names
                         };
                         let synced = sync_full_install_and_report(
+                            cfg,
                             &vault.ssh_target,
                             rsync_bin,
                             category,
@@ -1165,6 +1181,7 @@ fn run_steam_manifest_only_pass(
                             old_manifest_to_purge = old_manifest;
                         }
                         let synced = sync_full_install_and_report(
+                            cfg,
                             &vault.ssh_target,
                             rsync_bin,
                             "steam",
@@ -1328,6 +1345,7 @@ fn run_pirata_manifest_only_pass(
                 Some(install_dir) if is_compat_tool_install(&install_dir) => {}
                 Some(install_dir) => {
                     sync_full_install_and_report(
+                        cfg,
                         &vault.ssh_target,
                         rsync_bin,
                         "piratas",
@@ -1510,6 +1528,7 @@ fn run_epic_pass(
                         let (base, epic_names) =
                             epic_remote.as_ref().expect("full=true garante Some");
                         let synced = sync_full_install_and_report(
+                            cfg,
                             &vault.ssh_target,
                             rsync_bin,
                             "epic",
@@ -1607,6 +1626,7 @@ fn run_epic_pass(
                     match resolved {
                         Some(install_dir) => {
                             sync_full_install_and_report(
+                                cfg,
                                 &vault.ssh_target,
                                 rsync_bin,
                                 "epic",

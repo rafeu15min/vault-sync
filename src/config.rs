@@ -71,6 +71,15 @@ pub struct Config {
     /// razão física que justifica 3 raízes locais separadas.
     #[serde(default)]
     pub remote_installs_base_path: Option<PathBuf>,
+    /// URL base do Anubis no servidor (ex.: `http://192.168.1.80:7070`). Com
+    /// ela, o `ingest` pede espaço ao Anubis antes de enviar um jogo novo
+    /// (ele apaga mídia já vista até o disco ficar com no máximo 85 % usado
+    /// depois do jogo). Sem ela, nada muda e o envio segue como sempre.
+    #[serde(default)]
+    pub anubis_url: Option<String>,
+    /// `server.token` do Anubis, quando ele exige (rota `/storage/prune`).
+    #[serde(default)]
+    pub anubis_token: Option<String>,
     /// Overrides manuais de caminho de instalação — ver
     /// `InstallPathOverrides`. Vazio por padrão (nenhum override), nunca
     /// `None` — mapas vazios já significam "nada sobrescrito" sem precisar
@@ -222,6 +231,8 @@ impl Config {
             local_game_root_piratas: None,
             local_game_root_epic: None,
             remote_installs_base_path: None,
+            anubis_url: None,
+            anubis_token: None,
             install_path_overrides: InstallPathOverrides::default(),
             steam_account: None,
             ingest_exclude_steam: std::collections::HashSet::new(),
